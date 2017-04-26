@@ -1,0 +1,178 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use File::Basename;
+use Getopt::Long;
+
+# use the library for version control
+my $directory;
+BEGIN {$directory = dirname $0;} 
+use lib "${directory}/../lib";
+
+if (!-e "${directory}/../lib/version.pm") {
+   die "\nERROR: ${directory}/../lib/version.pm does not exist\n\n";
+}
+use version;
+
+# turn on auto flush
+$| = 1;
+
+my $program_name = basename $0;
+my $date         = $version::date;
+my $version      = $version::version;
+
+my $in_name_fastq;
+my $in_fasta;
+
+my $out_order_file;
+my $out_fasta;
+
+my $help;
+
+my $header =
+"
+----------------------------------------------------------------------
+PROGRAM: $program_name
+CONTACT: Yun Heo (yunheo1\@illinois.edu)
+VERSION: $version
+DATE   : $date
+----------------------------------------------------------------------
+\n";
+
+my $usage =
+"USAGE: $program_name <ARGUMENTS>
+
+ARGUMENT           DESCRIPTION                     MANDATORY   DEFAULT
+----------------------------------------------------------------------
+-h                 print help                      N
+-infasta  <file>   fasta file to be renamed        Y
+-namefastq <file>  fastq file with a right name    Y
+-outfasta <file>   output fasta file               Y
+----------------------------------------------------------------------
+\n";
+
+
+
+######################################################################
+# main code
+######################################################################
+
+&print_header;
+
+&parse_arguments;
+
+&rename_fasta_file;
+
+print "\n####################### SUCCESSFULLY COMPLETED #######################\n\n";
+
+######################################################################
+# end of main code
+######################################################################
+
+
+
+#---------------------------------------------------------------------
+# print_header
+#---------------------------------------------------------------------
+sub print_header {
+   print $header;
+}
+
+
+
+#---------------------------------------------------------------------
+# parse_arguments
+#---------------------------------------------------------------------
+sub parse_arguments {
+   my $base_name;
+
+   if (@ARGV == 0) {
+      die $usage;
+   }
+
+   print "Parsing arguments\n";
+
+   if (!GetOptions (
+                    "h"           => \$help,
+                    "namefastq=s" => \$in_name_fastq,
+                    "infasta=s"   => \$in_fasta,
+                    "outfasta=s"  => \$out_fasta,
+                   )
+       or $help) {
+      die $usage;
+   }
+
+   # fasta with right names
+   if (!defined($in_name_fastq)) {
+      die "\nERROR: A fasta file with a right order should be specified\n\n";
+   }
+   elsif (!-e "$in_name_fastq") {
+      die "\nERROR: Cannot open $in_name_fastq\n\n";
+   }
+
+   # fasta to be renamed
+   if (!defined($in_fasta)) {
+      die "\nERROR: A fasta file to be renamed should be specified\n\n";
+   }
+   elsif (!-e "$in_fasta") {
+      die "\nERROR: Cannot open $in_fasta\n\n";
+   }
+
+   # output fasta
+   if (!defined($out_fasta)) {
+      die "\nERROR: An output fasta file should be specified\n\n";
+   }
+
+   print "     Parsing argumetns: done\n\n";
+}
+
+
+
+#---------------------------------------------------------------------
+# rename_fasta_file
+#---------------------------------------------------------------------
+sub rename_fasta_file {
+   print "Renaming a fasta file\n";
+
+   open FH_IN, "$in_fasta"
+      or die "\nERROR: Cannot open $in_fasta\n\n";
+   open FH_NAME, "$in_name_fastq"
+      or die "\nERROR: Cannot open $in_name_fastq\n\n";
+   open FH_OUT, ">$out_fasta"
+      or die "\nERROR: Cannot open $out_fasta\n\n";
+
+   my $line_name;
+   while (my $line_in = <FH_IN>) {
+      # header line from $in_name_fastq
+      $line_name = <FH_NAME>;
+      if ($line_name !~ /^\@/) {
+         die "\nERROR: The number of lines in $in_fasta is different from that in $in_name_fastq\n\n";
+      }
+      $line_name =~ s/^\@/>/;
+      print FH_OUT $line_name;
+
+      $line_name = <FH_NAME>;
+      $line_name = <FH_NAME>;
+      $line_name = <FH_NAME>;
+
+      # remaining lines from $in_fasta
+      $line_in = <FH_IN>;
+      print FH_OUT $line_in;
+#      $line_in = <FH_IN>;
+#      print FH_OUT $line_in;
+#      $line_in = <FH_IN>;
+#      print FH_OUT $line_in;
+   }
+
+   $line_name = <FH_NAME>;
+   if (defined($line_name)) {
+      die "\nERROR: The number of lines in $in_fasta is different from that in $in_name_fastq\n\n";
+   }
+
+   close FH_IN;
+   close FH_NAME;
+   close FH_OUT;
+
+   print "     Renaming a fasta file: done\n\n";
+}

@@ -1,0 +1,445 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use File::Basename;
+use Getopt::Long;
+use POSIX;
+
+# use the library for version control
+my $directory;
+BEGIN {$directory = dirname $0;} 
+use lib "${directory}/../lib";
+
+if (!-e "${directory}/../lib/version.pm") {
+   die "\nERROR: ${directory}/../lib/version.pm does not exist\n\n";
+}
+use version;
+
+# turn on auto flush
+$| = 1;
+
+my $full_name    = $0;
+my $program_name = basename $0;
+my $date         = $version::date;
+my $version      = $version::version;
+
+my $in_location_file;
+my $in_ref_1_file;
+my $in_ref_2_file;
+my $in_out_prefix;
+my $in_qs_offset;
+
+my $help;
+my $out_fastq1;
+my $out_fastq2;
+
+my $header =
+"
+----------------------------------------------------------------------
+PROGRAM: $program_name
+AUTHOR : Yun Heo
+VERSION: $version
+DATE   : $date
+----------------------------------------------------------------------
+\n";
+
+my $usage =
+"USAGE: $program_name <ARGUMENTS>
+
+ARGUMENT             DESCRIPTION                   MANDATORY   DEFAULT
+----------------------------------------------------------------------
+-h                   print help                    N
+-location   <file>   location file                 Y
+-offset <33 or 64>   quality score offset          N           33
+-prefix   <string>   output file prefix            Y
+-ref1       <file>   1st reference fasta file      Y
+-ref2       <file>   2nd reference fasta file      N
+----------------------------------------------------------------------
+\n";
+
+my %hash_ref_1;
+my %hash_ref_2;
+
+
+
+######################################################################
+# main code
+######################################################################
+
+&print_header;
+
+&parse_args;
+
+&read_ref_sequence($in_ref_1_file, \%hash_ref_1);
+
+if (defined($in_ref_2_file)) {
+   &read_ref_sequence($in_ref_2_file, \%hash_ref_2);
+}
+
+&write_reads;
+
+print "\n####################### SUCCESSFULLY COMPLETED #######################\n\n";
+
+######################################################################
+# end of main code
+######################################################################
+
+
+
+#----------------------------------------------------------------------
+# print_header
+#----------------------------------------------------------------------
+sub print_header {
+   print $header;
+}
+
+
+
+#----------------------------------------------------------------------
+# parse_args
+#----------------------------------------------------------------------
+sub parse_args {
+   my $base_name;
+
+   if (@ARGV == 0) {
+      die $usage;
+   }
+
+   print "Parsing arguments\n";
+
+   if (!GetOptions (
+                    "h"          => \$help,
+                    "location=s" => \$in_location_file,
+                    "prefix=s"   => \$in_out_prefix,
+                    "offset=i"   => \$in_qs_offset,
+                    "prefix=s"   => \$in_out_prefix,
+                    "ref1=s"     => \$in_ref_1_file,
+                    "ref2=s"     => \$in_ref_2_file,
+                   )
+       or $help) {
+      die $usage;
+   }
+
+   my $fh_tmp;
+
+   # location file
+   if (!defined($in_location_file)) {
+      die "\nERROR: Input file name should be specified\n\n";
+   }
+   elsif (!(open $fh_tmp, "$in_location_file")) {
+      die "\nERROR: Cannot open $in_location_file\n\n";
+   }
+   close $fh_tmp;
+
+   # 1st reference
+   if (!defined($in_ref_1_file)) {
+      die "\nERROR: The first genome file name should be specified\n\n";
+   }
+   elsif (!-e "$in_ref_1_file") {
+      die "\nERROR: Cannot open $in_ref_1_file\n\n";
+   }
+
+   # 2nd reference
+   if (defined($in_ref_2_file)) {
+      if (!-e "$in_ref_2_file") {
+         die "\nERROR: Cannot open $in_ref_2_file\n\n";
+      }
+   }
+
+   # output file
+   if (defined($in_out_prefix) == 0) {
+      die "\nERROR: The output file prefix should be specified\n\n";
+   }
+   else {
+      $out_fastq1 = $in_out_prefix . ".1.fastq";
+      $out_fastq2 = $in_out_prefix . ".2.fastq";
+   }
+
+   # quality score offset
+   if (!defined($in_qs_offset)) {
+      $in_qs_offset = 33;
+   }
+   else {
+      if (($in_qs_offset != 33) && ($in_qs_offset != 64)) {
+         die "\nERROR: Quality score offset should be either 33 or 64\n\n";
+      }
+   }
+
+   print "     Parsing argumetns: done\n";
+}
+
+
+
+#----------------------------------------------------------------------
+# read_ref_sequence
+#----------------------------------------------------------------------
+sub read_ref_sequence {
+   # check the number of arguments
+   my $num_arguments = 2;
+   my $function_name = "read_ref_sequence";
+   if (@_ != $num_arguments) {
+      die "\nERROR: The number of argumetns of $function_name should be $num_arguments\n\n";
+   }
+
+   print "Reading reference sequences\n";
+
+   # open files
+   my $fh_in;
+   open $fh_in, "$_[0]"
+      or die "\nERROR: Cannot open $_[0]\n\n";
+
+   my $seq_name      = "";
+   my $seq_name_tmp  = "";
+   my $buffer        = "";
+
+   while (my $line = <$fh_in>) {
+      chomp $line;
+
+      if ($line =~ /^>([\S\s]+)/) {
+         $seq_name_tmp = $1;
+
+         # update the hash table
+         # not the first sequence
+         if ($seq_name ne "") {
+            if (length($buffer) > 0) {
+               $_[1]{$seq_name} = $buffer;
+            }
+            else {
+               die "\nERROR: Buffer is empty\n\n";
+            }
+         }
+
+         # remove white space in the sequence name
+         $seq_name = $seq_name_tmp;
+         $seq_name =~ s/ //g;
+         $seq_name =~ s/\t//g;
+
+         $buffer = "";
+      }
+      elsif ($line =~ /^$/) {
+      }
+      else {
+         $line = uc $line;
+         $buffer = $buffer . $line;
+      }
+   }
+
+   if (length($buffer) > 0) {
+      unless(defined($_[1]{$seq_name})) {
+         $_[1]{$seq_name} = $buffer;
+      }
+      else {
+         die "\nERROR: Same sequence name\n\n";
+      }
+   }
+
+   close $fh_in;
+
+   print "     Reading reference sequences: done\n";
+}
+
+
+
+#----------------------------------------------------------------------
+# write_reads
+#----------------------------------------------------------------------
+sub write_reads {
+   print "Writing reads\n";
+
+   open FH_LOCATION, $in_location_file
+      or die "\nERROR: Cannot open $in_location_file\n\n";
+
+   open FH_OUT1, ">$out_fastq1"
+      or die "\nERROR: Cannot open $out_fastq1\n\n";
+   open FH_OUT2, ">$out_fastq2"
+      or die "\nERROR: Cannot open $out_fastq2\n\n";
+
+   my $read_length = 0;
+   my $num_lines   = 0;
+
+   # each location file line
+   while (my $line_location = <FH_LOCATION>) {
+      # lines that we are interested in
+      #
+      # forward read
+      #
+      # <read name> <ref 1 or 2> <ref name> <strand> <start index> <read length> <substitutions> <insertions> <deletions>
+      if ($line_location =~ /^(\S+)\s+([12])\s+(\S+)\s+([\+\-])\s+([\d\-]+)\s+(\d+)\s+\S+\s+(\S+)\s+(\S+)/) {
+         my $read_name   = $1;
+         my $genome      = $2;
+         my $seq_name    = $3;
+         my $strand      = $4;
+         my $position    = $5; # start from 1
+         my $read_length = $6;
+         my $insertion   = $7;
+         my $deletion    = $8;
+
+         my $num_insertions = 0;
+         my $num_deletions  = 0;
+
+         # count the number of insertions
+         unless ($insertion eq "-") {
+            while ($insertion =~ /\d+:([ACGT]+);/g) {
+               $num_insertions = $num_insertions + length $1;
+            }    
+         }    
+
+         # count the number of deletions
+         unless ($deletion eq "-") {
+            while ($deletion =~ /(\d+):[ACGT];/g) {
+               $num_deletions++;
+            }    
+         }   
+
+         # extract a sequence
+         my $out1 = extract_sequence($genome, $seq_name, $position, $strand, $num_insertions, $num_deletions, $read_length, $read_name);
+
+         #
+         # reverse read
+         #
+         $line_location = <FH_LOCATION>;
+         if (defined($line_location) == 0) {
+            die "\nERROR: The number of reads in $in_location_file is not even\n\n";
+         }
+
+         # <read name> <ref 1 or 2> <ref name> <strand> <start index> <read length> <substitutions> <insertions> <deletions>
+         if ($line_location =~ /^(\S+)\s+([12])\s+(\S+)\s+([\+\-])\s+([\d\-]+)\s+(\d+)\s+\S+\s+(\S+)\s+(\S+)/) {
+            $read_name   = $1;
+            $genome      = $2;
+            $seq_name    = $3;
+            $strand      = $4;
+            $position    = $5; # start from 1
+            $read_length = $6;
+            $insertion   = $7;
+            $deletion    = $8;
+
+            $num_insertions = 0;
+            $num_deletions  = 0;
+
+            # count the number of insertions
+            unless ($insertion eq "-") {
+               while ($insertion =~ /\d+:([ACGT]+);/g) {
+                  $num_insertions = $num_insertions + length $1;
+               }    
+            }    
+
+            # count the number of deletions
+            unless ($deletion eq "-") {
+               while ($deletion =~ /(\d+):[ACGT];/g) {
+                  $num_deletions++;
+               }    
+            }   
+
+            # extract a sequence
+            my $out2 = extract_sequence($genome, $seq_name, $position, $strand, $num_insertions, $num_deletions, $read_length, $read_name);
+
+            # write a read
+            print FH_OUT1 "$out1";
+            print FH_OUT2 "$out2";
+
+            $num_lines++;
+
+            if ($num_lines % 100000 == 0) {
+               printf "     %12d lines processed\n", $num_lines;
+            }
+         }
+         # first: normal line; second: N/A
+         # do nothing
+         elsif ($line_location !~ /^(\S+)\s+N\/A$/) {
+            die "\nERROR: $line_location\n";
+         }
+      }
+      # first line: N/A
+      elsif ($line_location =~ /^(\S+)\s+N\/A$/) {
+         # skep the next line
+         $line_location = <FH_LOCATION>;
+      }
+      else {
+         die "\nERROR: $line_location\n";
+      }
+   }
+
+   close FH_LOCATION;
+   close FH_OUT1;
+   close FH_OUT2;
+
+   print "     Writing reads: done\n"
+}
+
+
+
+#----------------------------------------------------------------------
+# extract_sequence
+#----------------------------------------------------------------------
+sub extract_sequence {
+  # check the number of arguments
+   my $num_arguments = 8;
+   my $function_name = "extact_sequence";
+   if (@_ != $num_arguments) {
+      die "\nERROR: The number of arguments of $function_name is not $num_arguments\n\n"
+   }
+
+   my ($genome, $seq_name, $position, $strand, $num_insertions, $num_deletions, $read_length, $read_name) = @_;
+
+   my $original_seq;
+   if ($genome eq "1") {
+      $original_seq = substr($hash_ref_1{$seq_name}, $position - 1, $read_length - $num_insertions + $num_deletions);
+      $original_seq = uc $original_seq;
+
+      if ($strand eq "-") {
+         $original_seq = reverse $original_seq;
+         $original_seq =~ s/A/A_/g;
+         $original_seq =~ s/C/C_/g;
+         $original_seq =~ s/G/G_/g;
+         $original_seq =~ s/T/T_/g;
+         $original_seq =~ s/A_/T-/g;
+         $original_seq =~ s/C_/G-/g;
+         $original_seq =~ s/G_/C-/g;
+         $original_seq =~ s/T_/A-/g;
+         $original_seq =~ s/-//g;
+      }
+   }
+   elsif ($genome eq "2") {
+      if (!defined($in_ref_2_file)) {
+         die "\nERROR: The location file has reads coming from Ref 2. Please, use the -ref2 option\n\n";
+      }
+
+      $original_seq = substr($hash_ref_2{$seq_name}, $position - 1, $read_length - $num_insertions + $num_deletions);
+      $original_seq = uc $original_seq;
+
+      if ($strand eq "-") {
+         $original_seq = reverse $original_seq;
+         $original_seq =~ s/A/A_/g;
+         $original_seq =~ s/C/C_/g;
+         $original_seq =~ s/G/G_/g;
+         $original_seq =~ s/T/T_/g;
+         $original_seq =~ s/A_/T-/g;
+         $original_seq =~ s/C_/G-/g;
+         $original_seq =~ s/G_/C-/g;
+         $original_seq =~ s/T_/A-/g;
+         $original_seq =~ s/-//g;
+      }
+   }
+   else {
+      die "\nERROR: Illegal genome $genome\n\n";
+   }
+
+   $read_name = "@" . $read_name;
+
+   my $quality_score;
+   
+   if ($in_qs_offset == 33) {
+      $quality_score = "I" x length($original_seq);
+   }
+   elsif ($in_qs_offset == 64) {
+      $quality_score = "h" x length($original_seq);
+   }
+   else {
+      die "\nERROR: Irregular quality score offset $in_qs_offset\n\n";
+   }
+
+   my $out_seq = $read_name . "\n" . $original_seq . "\n" . "+" . "\n" . $quality_score . "\n";
+
+   return $out_seq;
+}

@@ -1,0 +1,2149 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use File::Basename;
+use Getopt::Long;
+use POSIX;
+
+# these modules should be installed
+eval {
+   use Parallel::MPI::Simple;
+};
+if ($@) {
+   die "\nERROR: Module Parallel::MPI::Simple is not installed\n\n";
+}
+
+# turn on auto flush
+$| = 1;
+
+# use the custom nw algorithm library
+my $directory;
+BEGIN {$directory = dirname $0;}
+use lib "${directory}/../lib";
+
+if (!-e "${directory}/../lib/evaluate.pm") {
+   die "\nERROR: ${directory}/../lib/evaluate.pm does not exist\n\n";
+}
+use evaluate;
+
+# use the library for version control
+if (!-e "${directory}/../lib/version.pm") {
+   die "\nERROR: ${directory}/../lib/version.pm does not exist\n\n";
+}
+use version;
+
+my $full_name                     = $0;
+my $program_name                  = basename $0;
+my $date                          = $version::date;
+my $version                       = $version::version;
+my $neg_inf                       = -1000000000;
+my $alphabets                     = "ACGT";
+my $max_seq_length                = 50000;
+my $max_read_length               = 50000;
+my $max_candidates_default        = 30000;
+my $max_candidate                 = 200;
+my $match_gain_default            = 1;
+my $mismatch_penalty_default      = -4;
+my $gap_extension_penalty_default = -1;
+my $gap_opening_penalty_default   = -6;
+my $match_gain_pacbio             = 1;
+my $mismatch_penalty_pacbio       = -1;
+my $gap_extension_penalty_pacbio  = -1;
+my $gap_opening_penalty_pacbio    = -1;
+
+# categorize bases
+# error-free | modified | error-free
+# before ec  |          | after ec
+#     Y           Y           Y     : cannot happen
+#     Y           Y           N     : yyn
+#     Y           N           Y     : yny
+#     Y           N           N     : cannot happen
+#     N           Y           Y     : nyy
+#     N           Y           N     : nyn
+#     N           N           Y     : cannot happen
+#     N           N           N     : nnn
+# number of error-free bases before error correction: yyn + yny
+# number of erroneous  bases before error correction: nyy + nyn + nnn
+# number of error-free bases after  error correction: yny + nyy
+# number of erroneous  bases after  error correction: yyn + nyn + nnn
+# number of modified bases                          : yyn + nyy + nyn
+# number of unmodified bases                        : yny + nnn
+# number of correctly modified bases                : nyy
+# number of uncorrectly modified bases              : nyn
+my $num_yyns_substitution;
+my $num_ynys_substitution;
+my $num_nyys_substitution;
+my $num_nyns_substitution;
+my $num_nnns_substitution;
+
+my $num_yyns_insertion;
+#my $num_ynys_insertion;
+my $num_nyys_insertion;
+my $num_nyns_insertion;
+my $num_nnns_insertion;
+
+my $num_yyns_deletion;
+#my $num_ynys_deletion;
+my $num_nyys_deletion;
+my $num_nyns_deletion;
+my $num_nnns_deletion;
+
+my $num_nyys_substitution_trim;
+
+my $num_nyys_insertion_trim;
+
+my $num_nyys_deletion_trim;
+
+# substition -> deletion
+my $num_from_substitution_to_deletion;
+
+my $num_trimmed_bases;
+
+my $num_not_evaluated_substitution;
+my $num_not_evaluated_insertion;
+my $num_not_evaluated_deletion;
+
+my $total_substitutions;
+my $total_insertions;
+my $total_deletions;
+
+my $max_read_length_real;
+
+my @position_array;
+my @position_array_corrected;
+
+my $header =
+"
+----------------------------------------------------------------------
+PROGRAM: $program_name
+CONTACT: Yun Heo (yunheo1\@illinois.edu)
+VERSION: $version
+DATE   : $date
+----------------------------------------------------------------------
+\n";
+
+my $usage =
+"USAGE: $program_name <ARGUMENTS>
+
+ARGUMENT             DESCRIPTION                   MANDATORY   DEFAULT
+----------------------------------------------------------------------
+-candidate <number>  max number of candidates      N             $max_candidates_default
+-corfasta  <file>    corrected single fasta file   N
+-corfasta1 <file>    corrected forward fasta file  N
+-corfasta2 <file>    corrected reverse fasta file  N
+-corfastq  <file>    corrected single fastq file   N
+-corfastq1 <file>    corrected forward fastq file  N
+-corfastq2 <file>    corrected reverse fastq file  N
+-debug     <prefix>  write evaluation detail       N
+-endgap              penalize end gaps             N
+-gext      <number>  gap extension penalty         N   $gap_extension_penalty_default (PacBio: $gap_extension_penalty_pacbio)
+-gopen     <number>  gap opening penalty           N   $gap_opening_penalty_default (PacBio: $gap_opening_penalty_pacbio)
+-h                   print help                    N
+-location  <file>    error location file           Y
+-match     <number>  match gain                    N    $match_gain_default (PacBio:  $match_gain_pacbio)
+-mmatch    <number>  mismatch penalty              N   $mismatch_penalty_default (PacBio: $mismatch_penalty_pacbio)
+-orgfasta  <file>    single original fasta file    N
+-orgfasta1 <file>    original forward fasta file   N
+-orgfasta2 <file>    original reverse fasta file   N
+-orgfastq  <file>    original single fastq file    N
+-orgfastq1 <file>    original forward fastq file   N
+-orgfastq2 <file>    original reverse fastq file   N
+-pacbio              PacBio reads                  N
+-ref       <file>    error-free single fasta file  N
+-ref1      <file>    error-free forward fasta file N
+-ref2      <file>    error-free reverse fasta file N
+----------------------------------------------------------------------
+\n";
+
+
+
+######################################################################
+# main code
+######################################################################
+
+MPI_Init();
+
+#
+# variables
+#
+my $org_fastq_input = 1;
+my $cor_fastq_input = 1;
+
+my $num_yyns_substitution_local = 0;
+my $num_ynys_substitution_local = 0;
+my $num_nyys_substitution_local = 0;
+my $num_nyns_substitution_local = 0;
+my $num_nnns_substitution_local = 0;
+
+my $num_yyns_insertion_local = 0;
+#my $num_ynys_insertion_local = 0;
+my $num_nyys_insertion_local = 0;
+my $num_nyns_insertion_local = 0;
+my $num_nnns_insertion_local = 0;
+
+my $num_yyns_deletion_local = 0;
+#my $num_ynys_deletion_local = 0;
+my $num_nyys_deletion_local = 0;
+my $num_nyns_deletion_local = 0;
+my $num_nnns_deletion_local = 0;
+
+my $num_not_evaluated_substitution_local = 0;
+my $num_not_evaluated_insertion_local    = 0;
+my $num_not_evaluated_deletion_local     = 0;
+
+my $num_from_substitution_to_deletion_local = 0;
+
+my $num_nyys_substitution_trim_local = 0;
+
+my $num_nyys_insertion_trim_local = 0;
+
+my $num_nyys_deletion_trim_local = 0;
+
+my $total_substitutions_local = 0;
+my $total_insertions_local = 0;
+my $total_deletions_local = 0;
+
+my $num_deletions_5_prime_best = $neg_inf;
+my $num_deletions_3_prime_best = $neg_inf;
+
+my $num_substitutions = 0;
+my $num_insertions = 0;
+my $num_deletions = 0;
+
+my $alignment_score_best;
+my $alignment_score_new_best;
+
+my $alignment_best;
+my $alignment_best_for_insertion;
+
+my $num_trimmed_bases_local = 0;
+
+my $corrected_read_length;
+
+my $fh_debug_substitution_yyn;
+#my $fh_debug_substitution_yny;
+#my $fh_debug_substitution_nyy;
+my $fh_debug_substitution_nyn;
+my $fh_debug_substitution_nnn;
+
+my $fh_debug_insertion_yyn;
+my $fh_debug_insertion_nyy;
+my $fh_debug_insertion_nyn;
+my $fh_debug_insertion_nnn;
+
+my $fh_debug_deletion_yyn;
+my $fh_debug_deletion_nyy;
+my $fh_debug_deletion_nyn;
+my $fh_debug_deletion_nnn;
+
+#my $in_bam_file;
+my $in_location_file;
+my $in_error_free_fasta_file;
+my $in_error_free_fasta1_file;
+my $in_error_free_fasta2_file;
+my $in_org_fastq_file;
+my $in_org_fastq1_file;
+my $in_org_fastq2_file;
+my $in_org_fasta_file;
+my $in_org_fasta1_file;
+my $in_org_fasta2_file;
+my $in_cor_fastq_file;
+my $in_cor_fastq1_file;
+my $in_cor_fastq2_file;
+my $in_cor_fasta_file;
+my $in_cor_fasta1_file;
+my $in_cor_fasta2_file;
+my $in_match_gain;
+my $in_mismatch_penalty;
+my $in_gap_opening_penalty;
+my $in_gap_extension_penalty;
+my $in_debug_prefix;
+my $in_max_candidates;
+my $in_penalize_end_gap = 0;
+my $in_pacbio = 0;
+
+my $help;
+my $matrix;
+my $is_trimmed;
+my $is_paired = 1;
+
+my $num_yyns_substitution_local_prev;
+my $num_ynys_substitution_local_prev;
+my $num_nyys_substitution_local_prev;
+my $num_nyns_substitution_local_prev;
+my $num_nnns_substitution_local_prev;
+
+my $num_yyns_insertion_local_prev;
+my $num_nyys_insertion_local_prev;
+my $num_nyns_insertion_local_prev;
+my $num_nnns_insertion_local_prev;
+
+my $num_yyns_deletion_local_prev;
+my $num_nyys_deletion_local_prev;
+my $num_nyns_deletion_local_prev;
+my $num_nnns_deletion_local_prev;
+
+my $num_not_evaluated_substitution_local_prev;
+my $num_not_evaluated_insertion_local_prev;
+my $num_not_evaluated_deletion_local_prev;
+
+my $num_from_substitution_to_deletion_local_prev;
+
+my $num_nyys_substitution_trim_local_prev;
+
+my $num_nyys_insertion_trim_local_prev;
+
+my $num_nyys_deletion_trim_local_prev;
+
+# 1-based
+my $end_index;
+my $ref_length_taken;
+my $strand;
+my $read_name;
+
+my $substitution;
+my $insertion;
+my $deletion;
+
+my @score_matrix;
+
+my @position_array_local;
+my @corrected_position_array_local;
+
+# c version
+my $position_vector_local;
+my $corrected_position_vector_local;
+
+my %hash_substitution_org;
+my %hash_substitution_err;
+my %hash_insertion;
+my %hash_deletion;
+my %hash_complement;
+
+# mpi variables
+my $rank      = MPI_Comm_rank(MPI_COMM_WORLD);
+my $num_procs = MPI_Comm_size(MPI_COMM_WORLD);
+my $rank_text = sprintf "%0*d", 3, $rank;
+
+#
+# print header
+#
+if ($rank == 0) {
+   &print_header;
+}
+
+#
+# parse arguments
+#
+&parse_args;
+
+#
+# compare reads
+#
+&compare_reads;
+
+MPI_Finalize();
+
+if ($rank == 0) {
+   print "\n####################### SUCCESSFULLY COMPLETED #######################\n\n";
+}
+
+######################################################################
+# end of main code
+######################################################################
+
+
+
+#----------------------------------------------------------------------
+# print_header
+#----------------------------------------------------------------------
+sub print_header {
+   print $header;
+}
+
+
+
+#----------------------------------------------------------------------
+# parse_args
+#----------------------------------------------------------------------
+sub parse_args {
+   if (@ARGV == 0) {
+      if ($rank == 0) {
+         print $usage;
+      }
+
+      exit;
+   }
+
+   if ($rank == 0) {
+      print "Parsing arguments\n";
+   }
+
+   if (!GetOptions (
+                    "candidate=i" => \$in_max_candidates,
+                    "corfasta=s"  => \$in_cor_fasta_file,
+                    "corfasta1=s" => \$in_cor_fasta1_file,
+                    "corfasta2=s" => \$in_cor_fasta2_file,
+                    "corfastq=s"  => \$in_cor_fastq_file,
+                    "corfastq1=s" => \$in_cor_fastq1_file,
+                    "corfastq2=s" => \$in_cor_fastq2_file,
+                    "debug=s"     => \$in_debug_prefix,
+                    "endgap"      => \$in_penalize_end_gap,
+                    "gext=i"      => \$in_gap_extension_penalty,
+                    "gopen=i"     => \$in_gap_opening_penalty,
+                    "h"           => \$help,
+                    "location=s"  => \$in_location_file,
+                    "match=i"     => \$in_match_gain,
+                    "mmatch=i"    => \$in_mismatch_penalty,
+                    "orgfasta=s"  => \$in_org_fasta_file,
+                    "orgfasta1=s" => \$in_org_fasta1_file,
+                    "orgfasta2=s" => \$in_org_fasta2_file,
+                    "orgfastq=s"  => \$in_org_fastq_file,
+                    "orgfastq1=s" => \$in_org_fastq1_file,
+                    "orgfastq2=s" => \$in_org_fastq2_file,
+                    "pacbio"      => \$in_pacbio,
+                    "reffasta=s"  => \$in_error_free_fasta_file,
+                    "reffasta1=s" => \$in_error_free_fasta1_file,
+                    "reffasta2=s" => \$in_error_free_fasta2_file,
+                   )
+       or $help) {
+      die $usage;
+   }
+
+   # check the location file
+   if (!defined($in_location_file)) {
+      die "\nERROR: An error location file name should be specified\n\n";
+   }
+   elsif (!-e "$in_location_file") {
+      die "\nERROR: $in_location_file does not exist\n\n";
+   }
+
+   # original read input is defined?
+   if (!defined($in_org_fastq_file) &&
+       !defined($in_org_fasta_file) &&
+       !((defined($in_org_fastq1_file)) && (defined($in_org_fastq2_file))) &&
+       !((defined($in_org_fasta1_file)) && (defined($in_org_fasta2_file)))
+      ) {
+         die "\nERROR: Use one of 1) -orgfasta, 2) -orgfastq, 3) -orgfastq1 -orgfastq2, or 4) -orgfasta1 -orgfasta2\n\n";
+   }
+
+   # corrected read input is defined?
+   if (!defined($in_cor_fastq_file) &&
+       !defined($in_cor_fasta_file) &&
+       !((defined($in_cor_fastq1_file)) && (defined($in_cor_fastq2_file))) &&
+       !((defined($in_cor_fasta1_file)) && (defined($in_cor_fasta2_file)))
+      ) {
+         die "\nERROR: Use one of 1) -corfasta, 2) -corfastq, 3) -corfastq1 -corfastq2, or 4) -corfasta1 -corfasta2\n\n";
+   }
+
+   # original fastq1 is defined?
+   if (defined($in_org_fastq1_file)) {
+      # check whether fastq1 exists
+      if (-e "$in_org_fastq1_file") {
+         # fasta* are defined?
+         if (defined($in_org_fasta1_file) || defined($in_org_fasta2_file)) {
+            die "\nERROR: One between fastq and fasta should be chosen for original reads\n\n";
+         }
+      }
+      else {
+         die "\nERROR: $in_org_fastq1_file does not exist\n\n";
+      }
+
+      # fastq2 is defined?
+      if (defined($in_org_fastq2_file)) {
+         unless (-e "$in_org_fastq2_file") {
+            die "\nERROR: $in_org_fastq2_file does not exist\n\n";
+         }
+      }
+      else {
+         die "\nERROR: The second original fastq file name should be specified\n\n";
+      }
+
+      # fastq is defined?
+      if (defined($in_org_fastq_file)) {
+         die "\nERROR: -orgfastq and -orgfastq1 cannot be used together\n\n";
+      }
+      # fasta is defined?
+      elsif (defined($in_org_fasta_file)) {
+         die "\nERROR: -orgfasta and -orgfastq1 cannot be used together\n\n";
+      }
+   }
+
+   # original fastq is defined?
+   if (defined($in_org_fastq_file)) {
+      # check whether fastq exists
+      unless (-e "$in_org_fastq_file") {
+         die "\nERROR: $in_org_fastq_file does not exist\n\n";
+      }
+
+      $is_paired = 0;
+   }
+
+   # original fasta is defined?
+   if (defined($in_org_fasta_file)) {
+      # check whether fasta exists
+      unless (-e "$in_org_fasta_file") {
+         die "\nERROR: $in_org_fasta_file does not exist\n\n";
+      }
+
+      $is_paired       = 0;
+      $org_fastq_input = 0;
+   }
+
+   # original fasta1 is defined?
+   if (defined($in_org_fasta1_file)) {
+      # check whether fasta1 exists
+      if (-e "$in_org_fasta1_file") {
+         # fastq* are defined?
+         if (defined($in_org_fastq1_file) || defined($in_org_fastq2_file)) {
+            die "\nERROR: One between fastq and fasta should be chosen for original reads\n\n";
+         }
+      }
+      else {
+         die "\nERROR: $in_org_fasta1_file does not exist\n\n";
+      }
+
+      # fasta2 is defined?
+      if (defined($in_org_fasta2_file)) {
+         if (-e "$in_org_fasta2_file") {
+            # input format is fasta
+            $org_fastq_input = 0;
+         }
+         else {
+            die "\nERROR: $in_org_fasta2_file does not exist\n\n";
+         }
+      }
+      else {
+         die "\nERROR: The second original fasta file name should be specified\n\n";
+      }
+
+      # fastq is defined?
+      if (defined($in_org_fastq_file)) {
+         die "\nERROR: -orgfastq and -orgfasta1 cannot be used together\n\n";
+      }
+      # fasta is defined?
+      elsif (defined($in_org_fasta_file)) {
+         die "\nERROR: -orgfasta and -orgfasta1 cannot be used together\n\n";
+      }
+   }
+
+   # corrected fastq is defined?
+   if (defined($in_cor_fastq_file)) {
+      if (!defined($in_org_fasta_file) && !defined($in_org_fastq_file)) {
+         die "\nERROR: -corfastq should be used with -orgfastq or -orgfasta\n\n";
+      }
+
+      # check whether fastq exists
+      unless (-e "$in_cor_fastq_file") {
+         die "\nERROR: $in_cor_fastq_file does not exist\n\n";
+      }
+   }
+
+   # corrected fasta is defined?
+   if (defined($in_cor_fasta_file)) {
+      if (!defined($in_org_fasta_file) && !defined($in_org_fastq_file)) {
+         die "\nERROR: -corfasta should be used with -orgfastq or -orgfasta\n\n";
+      }
+
+      # check whether fasta exists
+      unless (-e "$in_cor_fasta_file") {
+         die "\nERROR: $in_cor_fasta_file does not exist\n\n";
+      }
+
+      $cor_fastq_input = 0;
+   }
+
+   # corrected fastq1 is defined?
+   if (defined($in_cor_fastq1_file)) {
+      # check whether fastq1 exists
+      if (-e "$in_cor_fastq1_file") {
+         # fasta* are defined?
+         if (defined($in_cor_fasta1_file) || defined($in_cor_fasta2_file)) {
+            die "\nERROR: One between fastq and fasta should be chosen for corrected reads\n\n";
+         }
+      }
+      else {
+         die "\nERROR: $in_cor_fastq1_file does not exist\n\n";
+      }
+
+      # fastq2 is defined?
+      if (defined($in_cor_fastq2_file)) {
+         unless (-e "$in_cor_fastq2_file") {
+            die "\nERROR: $in_cor_fastq2_file does not exist\n\n";
+         }
+      }
+      else {
+         die "\nERROR: The second corrected fastq file name should be specified\n\n";
+      }
+
+      # fastq is defined?
+      if (defined($in_cor_fastq_file)) {
+         die "\nERROR: -corfastq and -corfastq1 cannot be used together\n\n";
+      }
+      # fasta is defined?
+      elsif (defined($in_cor_fasta_file)) {
+         die "\nERROR: -corfasta and -corfastq1 cannot be used together\n\n";
+      }
+   }
+
+   # corrected fasta1 is defined?
+   if (defined($in_cor_fasta1_file)) {
+      # check whether fasta1 exists
+      if (-e "$in_cor_fasta1_file") {
+         # fastq* are defined?
+         if (defined($in_cor_fastq1_file) || defined($in_cor_fastq2_file)) {
+            die "\nERROR: One between fastq and fasta should be chosen corrected reads\n\n";
+         }
+      }
+      else {
+         die "\nERROR: $in_cor_fasta1_file does not exist\n\n";
+      }
+
+      # fasta2 is defined?
+      if (defined($in_cor_fasta2_file)) {
+         if (-e "$in_cor_fasta2_file") {
+            # input format is fasta
+            $cor_fastq_input = 0;
+         }
+         else {
+            die "\nERROR: $in_cor_fasta2_file does not exist\n\n";
+         }
+      }
+      else {
+         die "\nERROR: The second corrected fasta file name should be specified\n\n";
+      }
+
+      # fastq is defined?
+      if (defined($in_cor_fastq_file)) {
+         die "\nERROR: -corfastq and -corfasta1 cannot be used together\n\n";
+      }
+      # fasta is defined?
+      elsif (defined($in_cor_fasta_file)) {
+         die "\nERROR: -corfasta and -corfasta1 cannot be used together\n\n";
+      }
+   }
+
+   # ref read
+
+   if ($is_paired) {
+      if (!defined($in_error_free_fasta1_file)) {
+         die "\nERROR: The 1st error-free read file name should be specified\n\n";
+      }
+      elsif (!-e "$in_error_free_fasta1_file") {
+         die "\nERROR: $in_error_free_fasta1_file does not exist\n\n";
+      }
+
+      if (!defined($in_error_free_fasta2_file)) {
+         die "\nERROR: The 2nd error-free read file name should be specified\n\n";
+      }
+      elsif (!-e "$in_error_free_fasta2_file") {
+         die "\nERROR: $in_error_free_fasta2_file does not exist\n\n";
+      }
+   }
+   else {
+      if (!defined($in_error_free_fasta_file)) {
+         die "\nERROR: The error-free read file name should be specified\n\n";
+      }
+      elsif (!-e "$in_error_free_fasta_file") {
+         die "\nERROR: $in_error_free_fasta_file does not exist\n\n";
+      }
+   }
+
+   # match gain
+   if (defined($in_match_gain)) {
+      if ($in_match_gain < 0) {
+         die "\nERROR: Match gain should be >= 0\n\n";
+      }
+   }
+   else {
+      if ($in_pacbio) {
+         $in_match_gain = $match_gain_pacbio;
+      }
+      else {
+         $in_match_gain = $match_gain_default;
+      }
+   }
+
+   # mismatch penalty
+   if (defined($in_mismatch_penalty)) {
+      if ($in_mismatch_penalty > 0) {
+         die "\nERROR: Mismatch penalty should be <= 0\n\n";
+      }
+   }
+   else {
+      if ($in_pacbio) {
+         $in_mismatch_penalty = $mismatch_penalty_pacbio;
+      }
+      else {
+         $in_mismatch_penalty = $mismatch_penalty_default;
+      }
+   }
+
+   # gap extension penalty
+   if (defined($in_gap_extension_penalty)) {
+      if ($in_gap_extension_penalty > 0) {
+         die "\nERROR: Gap extension penalty should be <= 0\n\n";
+      }
+   }
+   else {
+      if ($in_pacbio) {
+         $in_gap_extension_penalty = $gap_extension_penalty_pacbio;
+      }
+      else {
+         $in_gap_extension_penalty = $gap_extension_penalty_default;
+      }
+   }
+
+   # gap opening penalty
+   if (defined($in_gap_opening_penalty)) {
+      if ($in_gap_opening_penalty > 0) {
+         die "\nERROR: Gap open penalty should be <= 0\n\n";
+      }
+   }
+   else {
+      if ($in_pacbio) {
+         $in_gap_opening_penalty = $gap_opening_penalty_pacbio;
+      }
+      else {
+         $in_gap_opening_penalty = $gap_opening_penalty_default;
+      }
+   }
+
+   if (defined($in_debug_prefix)) {
+      open $fh_debug_substitution_yyn, ">${in_debug_prefix}.substitution.yyn.rank-${rank_text}.debug"
+         or die "\nERROR: Cannot open ${in_debug_prefix}.substitution.yyn.rank-${rank_text}.debug\n\n";
+      #open $fh_debug_substitution_yny, ">${in_debug_prefix}.substitution.yny.rank-${rank_text}.debug"
+      #   or die "\nERROR: Cannot open ${in_debug_prefix}.substitution.yny.rank-${rank_text}.debug\n\n";
+      #open $fh_debug_substitution_nyy, ">${in_debug_prefix}.substitution.nyy.rank-${rank_text}.debug"
+      #   or die "\nERROR: Cannot open ${in_debug_prefix}.substitution.nyy.rank-${rank_text}.debug\n\n";
+      open $fh_debug_substitution_nyn, ">${in_debug_prefix}.substitution.nyn.rank-${rank_text}.debug"
+         or die "\nERROR: Cannot open ${in_debug_prefix}.substitution.nyn.rank-${rank_text}.debug\n\n";
+      open $fh_debug_substitution_nnn, ">${in_debug_prefix}.substitution.nnn.rank-${rank_text}.debug"
+         or die "\nERROR: Cannot open ${in_debug_prefix}.substitution.nnn.rank-${rank_text}.debug\n\n";
+
+      open $fh_debug_insertion_yyn, ">${in_debug_prefix}.insertion.yyn.rank-${rank_text}.debug"
+         or die "\nERROR: Cannot open ${in_debug_prefix}.insertion.yyn.rank-${rank_text}.debug\n\n";
+      open $fh_debug_insertion_nyy, ">${in_debug_prefix}.insertion.nyy.rank-${rank_text}.debug"
+         or die "\nERROR: Cannot open ${in_debug_prefix}.insertion.nyy.rank-${rank_text}.debug\n\n";
+      open $fh_debug_insertion_nyn, ">${in_debug_prefix}.insertion.nyn.rank-${rank_text}.debug"
+         or die "\nERROR: Cannot open ${in_debug_prefix}.insertion.nyn.rank-${rank_text}.debug\n\n";
+      open $fh_debug_insertion_nnn, ">${in_debug_prefix}.insertion.nnn.rank-${rank_text}.debug"
+         or die "\nERROR: Cannot open ${in_debug_prefix}.insertion.nnn.rank-${rank_text}.debug\n\n";
+
+      open $fh_debug_deletion_yyn, ">${in_debug_prefix}.deletion.yyn.rank-${rank_text}.debug"
+         or die "\nERROR: Cannot open ${in_debug_prefix}.deletion.yyn.rank-${rank_text}.debug\n\n";
+      open $fh_debug_deletion_nyy, ">${in_debug_prefix}.deletion.nyy.rank-${rank_text}.debug"
+         or die "\nERROR: Cannot open ${in_debug_prefix}.deletion.nyy.rank-${rank_text}.debug\n\n";
+      open $fh_debug_deletion_nyn, ">${in_debug_prefix}.deletion.nyn.rank-${rank_text}.debug"
+         or die "\nERROR: Cannot open ${in_debug_prefix}.deletion.nyn.rank-${rank_text}.debug\n\n";
+      open $fh_debug_deletion_nnn, ">${in_debug_prefix}.deletion.nnn.rank-${rank_text}.debug"
+         or die "\nERROR: Cannot open ${in_debug_prefix}.deletion.nnn.rank-${rank_text}.debug\n\n";
+   }
+
+   # set the hash for reverse complement
+   $hash_complement{"A"} = "T";
+   $hash_complement{"C"} = "G";
+   $hash_complement{"G"} = "C";
+   $hash_complement{"T"} = "A";
+
+   if ($rank == 0) {
+      print "     Code                 : $full_name\n";
+      print "     Number of processors : $num_procs\n";
+
+      if (defined($in_org_fastq_file)) {
+         print "     Original read        : $in_org_fastq_file\n";
+      }
+      elsif (defined($in_org_fasta_file)) {
+         print "     Original read        : $in_org_fasta_file\n";
+      }
+      elsif (defined($in_org_fastq1_file)) {
+         print "     Original read 1st    : $in_org_fastq1_file\n";
+         print "     Original read 2nd    : $in_org_fastq2_file\n";
+      }
+      else {
+         print "     Original read 1st    : $in_org_fasta1_file\n";
+         print "     Original read 2nd    : $in_org_fasta2_file\n";
+      }
+
+      if (defined($in_cor_fastq_file)) {
+         print "     Corrected read       : $in_cor_fastq_file\n";
+      }
+      elsif (defined($in_cor_fasta_file)) {
+         print "     Corrected read       : $in_cor_fasta_file\n";
+      }
+      elsif (defined($in_cor_fastq1_file)) {
+         print "     Corrected read 1st   : $in_cor_fastq1_file\n";
+         print "     Corrected read 2nd   : $in_cor_fastq2_file\n";
+      }
+      else {
+         print "     Corrected read 1st   : $in_cor_fasta1_file\n";
+         print "     Corrected read 2nd   : $in_cor_fasta2_file\n";
+      }
+
+      if (defined($in_error_free_fasta_file)) {
+         print "     Error-free read      : $in_error_free_fasta_file\n";
+      }
+      else {
+         print "     Error-free read 1st  : $in_error_free_fasta1_file\n";
+         print "     Error-free read 2nd  : $in_error_free_fasta2_file\n";
+      }
+
+      print "     Location file        : $in_location_file\n";
+      print "     Match gain           : $in_match_gain\n";
+      print "     Mismatatch penalty   : $in_mismatch_penalty\n";
+      print "     Gap opening penalty  : $in_gap_opening_penalty\n";
+      print "     Gap extension penalty: $in_gap_extension_penalty\n";
+
+      print "     Parsing argumetns: done\n";
+   }
+}
+
+
+#----------------------------------------------------------------------
+# compare_reads
+#----------------------------------------------------------------------
+sub compare_reads {
+   if ($rank == 0) {
+      print "\nComparing reads\n";
+   }
+
+   # construct and initialize the c arrays
+   $position_vector_local           = evaluate::new_intp($max_read_length);
+   $corrected_position_vector_local = evaluate::new_intp($max_read_length);
+
+   for (my $i = 0; $i <= $max_read_length; $i++) {
+      evaluate::intp_setitem($position_vector_local,           $i, 0);
+      evaluate::intp_setitem($corrected_position_vector_local, $i, 0);
+   }
+
+   my $fh_location;
+   my $fh_error_free_read1;
+   my $fh_error_free_read2;
+   my $fh_org_read1;
+   my $fh_org_read2;
+   my $fh_cor_read1;
+   my $fh_cor_read2;
+
+   # open the input location file
+   open $fh_location, "$in_location_file"
+      or die "\nERROR: Cannot open $in_location_file\n\n";
+
+   # open the error-free read file instead of reference sequences
+   # the error-free read input files should always be fasta files
+   if ($is_paired) {
+      open $fh_error_free_read1, "$in_error_free_fasta1_file"
+         or die "\nERROR: Cannot open $in_error_free_fasta1_file\n\n";
+      open $fh_error_free_read2, "$in_error_free_fasta2_file"
+         or die "\nERROR: Cannot open $in_error_free_fasta2_file\n\n";
+   }
+   else {
+      open $fh_error_free_read1, "$in_error_free_fasta_file"
+         or die "\nERROR: Cannot open $in_error_free_fasta_file\n\n";
+   }
+
+   # open original read files
+   if ($is_paired) {
+      if ($org_fastq_input == 1) {
+         open $fh_org_read1, "$in_org_fastq1_file"
+            or die "\nERROR: Cannot open $in_org_fastq1_file\n\n";
+         open $fh_org_read2, "$in_org_fastq2_file"
+            or die "\nERROR: Cannot open $in_org_fastq2_file\n\n";
+      }
+      else {
+         open $fh_org_read1, "$in_org_fasta1_file"
+            or die "\nERROR: Cannot open $in_org_fasta1_file\n\n";
+         open $fh_org_read2, "$in_org_fasta2_file"
+            or die "\nERROR: Cannot open $in_org_fasta2_file\n\n";
+      }
+   }
+   else {
+      if ($org_fastq_input == 1) {
+         open $fh_org_read1, "$in_org_fastq_file"
+            or die "\nERROR: Cannot open $in_org_fastq1_file\n\n";
+      }
+      else {
+         open $fh_org_read1, "$in_org_fasta_file"
+            or die "\nERROR: Cannot open $in_org_fasta1_file\n\n";
+      }
+   }
+
+   # open corrected read files
+   if ($is_paired) {
+      if ($cor_fastq_input == 1) {
+         open $fh_cor_read1, "$in_cor_fastq1_file"
+            or die "\nERROR: Cannot open $in_cor_fastq1_file\n\n";
+         open $fh_cor_read2, "$in_cor_fastq2_file"
+            or die "\nERROR: Cannot open $in_cor_fastq2_file\n\n";
+      }
+      else {
+         open $fh_cor_read1, "$in_cor_fasta1_file"
+            or die "\nERROR: Cannot open $in_cor_fasta1_file\n\n";
+         open $fh_cor_read2, "$in_cor_fasta2_file"
+            or die "\nERROR: Cannot open $in_cor_fasta2_file\n\n";
+      }
+   }
+   else {
+      if ($cor_fastq_input == 1) {
+         open $fh_cor_read1, "$in_cor_fastq_file"
+            or die "\nERROR: Cannot open $in_cor_fastq1_file\n\n";
+      }
+      else {
+         open $fh_cor_read1, "$in_cor_fasta_file"
+            or die "\nERROR: Cannot open $in_cor_fasta1_file\n\n";
+      }
+   }
+
+   # read each file
+   my $read_length;
+   my $num_lines = 0;
+
+   while (my $line_location = <$fh_location>) {
+      my $line_error_free_header1;
+      my $line_error_free_header2;
+      my $line_error_free_read1;
+      my $line_error_free_read2;
+
+      my $line_org_header1;
+      my $line_org_header2;
+      my $line_org_read1;
+      my $line_org_read2;
+
+      my $line_cor_header1;
+      my $line_cor_header2;
+      my $line_cor_read1;
+      my $line_cor_read2;
+
+      #
+      # lines that should be processed in this core
+      #
+      if (($num_lines % $num_procs) == $rank) {
+         #----------------------------------------------------------------------
+         # forward read
+         #----------------------------------------------------------------------
+         # read header and sequence lines of error-free reads
+         $line_error_free_header1 = <$fh_error_free_read1> ;
+         unless (defined($line_error_free_header1)) {
+            die "\nERROR: Number of lines in the error free read file is not matched with that in the original read\n\n";
+         }
+         $line_error_free_read1 = <$fh_error_free_read1>;
+
+         chomp $line_error_free_header1;
+         chomp $line_error_free_read1;
+
+         # read header and sequence lines of original reads
+         $line_org_header1 = <$fh_org_read1> ;
+         unless (defined($line_org_header1)) {
+            die "\nERROR: Number of lines in the location file is not matched with that in the original read (1)\n\n";
+         }
+         $line_org_read1 = <$fh_org_read1>;
+
+         chomp $line_org_header1;
+         chomp $line_org_read1;
+
+         # read header and sequence lines of corrected reads
+         $line_cor_header1 = <$fh_cor_read1>;
+         unless (defined($line_cor_header1)) {
+            die "\nERROR: Number of lines in the location file is not matched with that in the corrected read (1)\n\n";
+         }
+         $line_cor_read1 = <$fh_cor_read1>;
+
+         chomp $line_cor_header1;
+         chomp $line_cor_read1;
+
+         # check original read lines
+         if ($org_fastq_input == 1) {
+            unless ($line_org_header1 =~ /^\@/) {
+               die "\nERROR: $line_org_header1\n";
+            }
+         }
+         else {
+            unless ($line_org_header1 =~ /^\>/) {
+               die "\nERROR: $line_org_header1\n";
+            }
+         }
+
+         # check corrected read lines
+         if ($cor_fastq_input == 1) {
+            unless ($line_cor_header1 =~ /^\@/) {
+               die "\nERROR: $line_cor_header1\n";
+            }
+         }
+         else {
+            unless ($line_cor_header1 =~ /^\>/) {
+               die "\nERROR: $line_cor_header1\n";
+            }
+         }
+
+         # count the number of trimmed bases
+         # read_length: length of error_free_read = length of org_read
+         $read_length = length($line_org_read1);
+         $corrected_read_length = length($line_cor_read1);
+         my $trim_length = $read_length - $corrected_read_length;
+         if ($trim_length > 0) {
+            $is_trimmed = 1;
+            $num_trimmed_bases_local += $trim_length;
+         }
+         else {
+            $is_trimmed = 0;
+         }
+
+         # record current values
+         $num_yyns_substitution_local_prev = $num_yyns_substitution_local;
+         $num_ynys_substitution_local_prev = $num_ynys_substitution_local;
+         $num_nyys_substitution_local_prev = $num_nyys_substitution_local;
+         $num_nyns_substitution_local_prev = $num_nyns_substitution_local;
+         $num_nnns_substitution_local_prev = $num_nnns_substitution_local;
+
+         $num_yyns_insertion_local_prev = $num_yyns_insertion_local;
+         $num_nyys_insertion_local_prev = $num_nyys_insertion_local;
+         $num_nyns_insertion_local_prev = $num_nyns_insertion_local;
+         $num_nnns_insertion_local_prev = $num_nnns_insertion_local;
+
+         $num_yyns_deletion_local_prev = $num_yyns_deletion_local;
+         $num_nyys_deletion_local_prev = $num_nyys_deletion_local;
+         $num_nyns_deletion_local_prev = $num_nyns_deletion_local;
+         $num_nnns_deletion_local_prev = $num_nnns_deletion_local;
+
+         $num_not_evaluated_substitution_local_prev = $num_not_evaluated_substitution_local;
+         $num_not_evaluated_insertion_local_prev    = $num_not_evaluated_insertion_local;
+         $num_not_evaluated_deletion_local_prev     = $num_not_evaluated_deletion_local;
+
+         $num_from_substitution_to_deletion_local_prev = $num_from_substitution_to_deletion_local;
+
+         $num_nyys_substitution_trim_local_prev = $num_nyys_substitution_trim_local;
+
+         $num_nyys_insertion_trim_local_prev = $num_nyys_insertion_trim_local;
+
+         $num_nyys_deletion_trim_local_prev = $num_nyys_deletion_trim_local;
+
+         #
+         # compare the first read
+         #
+         &compare_one_read($line_location, $line_error_free_read1, $line_cor_read1, $read_length, $line_org_read1);
+
+         # check the number of processed errors
+         $total_substitutions_local += $num_substitutions;
+         $total_insertions_local    += $num_insertions;
+         $total_deletions_local     += $num_deletions;
+
+         # check the number of processed errors
+         # substitution
+         if ($num_substitutions > 0) {
+            if ($num_substitutions !=
+                (($num_nyys_substitution_local - $num_nyys_substitution_local_prev) +
+                 ($num_nyns_substitution_local - $num_nyns_substitution_local_prev) +
+                 ($num_nnns_substitution_local - $num_nnns_substitution_local_prev) +
+                 ($num_from_substitution_to_deletion_local - $num_from_substitution_to_deletion_local_prev) +
+                 ($num_nyys_substitution_trim_local - $num_nyys_substitution_trim_local_prev) +
+                 ($num_not_evaluated_substitution_local - $num_not_evaluated_substitution_local_prev))) {
+               printf "\nERROR: $line_org_header1\nS TOTAL(%d) vs NYY /wo TRIM(%d) + NYN(%d) + NNN(%d) + NYY TRIM(%d) + NOT EVAL(%d)\n\n",
+                  $num_substitutions,
+                  $num_nyys_substitution_local - $num_nyys_substitution_local_prev,
+                  $num_nyns_substitution_local - $num_nyns_substitution_local_prev,
+                  $num_nnns_substitution_local - $num_nnns_substitution_local_prev,
+                  $num_nyys_substitution_trim_local - $num_nyys_substitution_trim_local_prev,
+                  $num_not_evaluated_substitution_local - $num_not_evaluated_substitution_local_prev;
+               print "$alignment_best\n";
+               exit;
+            }
+         }
+
+         # insertion
+         if ($num_insertions > 0) {
+            if ($num_insertions !=
+                (($num_nyys_insertion_local - $num_nyys_insertion_local_prev) +
+                 ($num_nyns_insertion_local - $num_nyns_insertion_local_prev) +
+                 ($num_nnns_insertion_local - $num_nnns_insertion_local_prev) +
+                 ($num_nyys_insertion_trim_local - $num_nyys_insertion_trim_local_prev) +
+                 ($num_not_evaluated_insertion_local - $num_not_evaluated_insertion_local_prev))) {
+               printf "\nERROR: $line_org_header1\nI TOTAL(%d) vs NYY /wo TRIM(%d) + NYN(%d) + NNN(%d) + NYY TRIM(%d) + NOT EVAL(%d)\n\n",
+                  $num_insertions,
+                  $num_nyys_insertion_local - $num_nyys_insertion_local_prev,
+                  $num_nyns_insertion_local - $num_nyns_insertion_local_prev,
+                  $num_nnns_insertion_local - $num_nnns_insertion_local_prev,
+                  $num_nyys_insertion_trim_local - $num_nyys_insertion_trim_local_prev,
+                  $num_not_evaluated_insertion_local - $num_not_evaluated_insertion_local_prev;
+               print "$alignment_best_for_insertion\n";
+               exit;
+            }
+         }
+
+         # deletion
+         if ($num_deletions > 0) {
+            if ($num_deletions !=
+                (($num_nyys_deletion_local - $num_nyys_deletion_local_prev) +
+                 ($num_nyns_deletion_local - $num_nyns_deletion_local_prev) +
+                 ($num_nnns_deletion_local - $num_nnns_deletion_local_prev) +
+                 ($num_nyys_deletion_trim_local - $num_nyys_deletion_trim_local_prev) +
+                 ($num_not_evaluated_deletion_local - $num_not_evaluated_deletion_local_prev))) {
+               printf "\nERROR: $line_org_header1\nD TOTAL(%d) vs NYY /wo TRIM(%d) + NYN(%d) + NNN(%d) + NYY TRIM(%d) + NOT EVAL(%d)\n\n",
+                  $num_deletions,
+                  $num_nyys_deletion_local - $num_nyys_deletion_local_prev,
+                  $num_nyns_deletion_local - $num_nyns_deletion_local_prev,
+                  $num_nnns_deletion_local - $num_nnns_deletion_local_prev,
+                  $num_nyys_deletion_trim_local - $num_nyys_deletion_trim_local_prev,
+                  $num_not_evaluated_deletion_local - $num_not_evaluated_deletion_local_prev;
+               print "$alignment_best\n";
+               exit;
+            }
+         }
+         #
+         # end of forward read
+         #
+
+         #----------------------------------------------------------------------
+         # reverse read
+         #----------------------------------------------------------------------
+         if ($is_paired) {
+            $line_location = <$fh_location>;
+            unless (defined($line_location)) {
+               die "\nERROR: The number of reads in $in_location_file is odd\n\n";
+            }
+            else {
+               # error-free read
+               $line_error_free_header2 = <$fh_error_free_read2>;
+               unless (defined($line_error_free_header2)) {
+                  die "\nERROR: Number of lines in the location file is not matched with that in the error-free read\n\n";
+               }
+
+               $line_error_free_read2 = <$fh_error_free_read2>;
+               chomp $line_error_free_header2;
+               chomp $line_error_free_read2;
+
+               # original read
+               $line_org_header2 = <$fh_org_read2>;
+               unless (defined($line_org_header2)) {
+                  die "\nERROR: Number of lines in the location file is not matched with that in the original read (2)\n\n";
+               }
+
+               $line_org_read2 = <$fh_org_read2>;
+               chomp $line_org_header2;
+               chomp $line_org_read2;
+
+               # corrected read
+               $line_cor_header2 = <$fh_cor_read2>;
+               unless (defined($line_cor_header2)) {
+                  die "\nERROR: Number of lines in the location file is not matched with that in the corrected read (2)\n\n";
+               }
+
+               $line_cor_read2 = <$fh_cor_read2>;
+               chomp $line_cor_header2;
+               chomp $line_cor_read2;
+
+               # check error-free read lines
+               unless ($line_error_free_header2 =~ /^\>/) {
+                  die "\nERROR (1): $line_error_free_read2\n";
+               }
+
+               # check original read lines
+               if ($org_fastq_input == 1) {
+                  unless ($line_org_header2 =~ /^\@/) {
+                     die "\nERROR (2): $line_org_read2\n";
+                  }
+               }
+               else {
+                  unless ($line_org_header2 =~ /^\>/) {
+                     die "\nERROR (3): $line_org_read2\n";
+                  }
+               }
+
+               # check corrected read lines
+               if ($cor_fastq_input == 1) {
+                  unless ($line_cor_header2 =~ /^\@/) {
+                     die "\nERROR (4): $line_cor_read2\n";
+                  }
+               }
+               else {
+                  unless ($line_cor_header2 =~ /^\>/) {
+                     die "\nERROR (5): $line_cor_read2\n";
+                  }
+               }
+
+               # count the number of trimmed bases
+               $read_length = length($line_org_read2);
+               $corrected_read_length = length($line_cor_read2);
+               $trim_length = $read_length - $corrected_read_length;
+               if ($trim_length > 0) {
+                  $is_trimmed = 1;
+                  $num_trimmed_bases_local += $trim_length;
+               }
+               else {
+                  $is_trimmed = 0;
+               }
+
+               # record current values
+               $num_yyns_substitution_local_prev = $num_yyns_substitution_local;
+               $num_ynys_substitution_local_prev = $num_ynys_substitution_local;
+               $num_nyys_substitution_local_prev = $num_nyys_substitution_local;
+               $num_nyns_substitution_local_prev = $num_nyns_substitution_local;
+               $num_nnns_substitution_local_prev = $num_nnns_substitution_local;
+
+               $num_yyns_insertion_local_prev = $num_yyns_insertion_local;
+               $num_nyys_insertion_local_prev = $num_nyys_insertion_local;
+               $num_nyns_insertion_local_prev = $num_nyns_insertion_local;
+               $num_nnns_insertion_local_prev = $num_nnns_insertion_local;
+
+               $num_yyns_deletion_local_prev = $num_yyns_deletion_local;
+               $num_nyys_deletion_local_prev = $num_nyys_deletion_local;
+               $num_nyns_deletion_local_prev = $num_nyns_deletion_local;
+               $num_nnns_deletion_local_prev = $num_nnns_deletion_local;
+
+               $num_not_evaluated_substitution_local_prev = $num_not_evaluated_substitution_local;
+               $num_not_evaluated_insertion_local_prev    = $num_not_evaluated_insertion_local;
+               $num_not_evaluated_deletion_local_prev     = $num_not_evaluated_deletion_local;
+
+               $num_from_substitution_to_deletion_local_prev = $num_from_substitution_to_deletion_local;
+
+               $num_nyys_substitution_trim_local_prev = $num_nyys_substitution_trim_local;
+
+               $num_nyys_insertion_trim_local_prev = $num_nyys_insertion_trim_local;
+
+               $num_nyys_deletion_trim_local_prev = $num_nyys_deletion_trim_local;
+
+               # compare the second read
+               &compare_one_read($line_location, $line_error_free_read2, $line_cor_read2, $read_length, $line_org_read2);
+
+               # check the number of processed errors
+               $total_substitutions_local += $num_substitutions;
+               $total_insertions_local    += $num_insertions;
+               $total_deletions_local     += $num_deletions;
+
+               # check the number of processed errors
+               # substitution
+               if ($num_substitutions > 0) {
+                  if ($num_substitutions !=
+                      (($num_nyys_substitution_local - $num_nyys_substitution_local_prev) +
+                       ($num_nyns_substitution_local - $num_nyns_substitution_local_prev) +
+                       ($num_nnns_substitution_local - $num_nnns_substitution_local_prev) +
+                       ($num_from_substitution_to_deletion_local - $num_from_substitution_to_deletion_local_prev) +
+                       ($num_nyys_substitution_trim_local - $num_nyys_substitution_trim_local_prev) +
+                       ($num_not_evaluated_substitution_local - $num_not_evaluated_substitution_local_prev))) {
+                     printf "\nERROR: $line_org_header2\nS TOTAL(%d) vs NYY /wo TRIM(%d) + NYN(%d) + NNN(%d) + NYY TRIM(%d) + NOT EVAL(%d)\n\n",
+                        $num_substitutions,
+                        $num_nyys_substitution_local - $num_nyys_substitution_local_prev,
+                        $num_nyns_substitution_local - $num_nyns_substitution_local_prev,
+                        $num_nnns_substitution_local - $num_nnns_substitution_local_prev,
+                        $num_nyys_substitution_trim_local - $num_nyys_substitution_trim_local_prev,
+                        $num_not_evaluated_substitution_local - $num_not_evaluated_substitution_local_prev;
+                     print "$alignment_best\n";
+                     exit;
+                  }
+               }
+
+               # insertion
+               if ($num_insertions > 0) {
+                  if ($num_insertions !=
+                      (($num_nyys_insertion_local - $num_nyys_insertion_local_prev) +
+                       ($num_nyns_insertion_local - $num_nyns_insertion_local_prev) +
+                       ($num_nnns_insertion_local - $num_nnns_insertion_local_prev) +
+                       ($num_nyys_insertion_trim_local - $num_nyys_insertion_trim_local_prev) + 
+                       ($num_not_evaluated_insertion_local - $num_not_evaluated_insertion_local_prev))) {
+                     printf "\nERROR: $line_org_header2\nI TOTAL(%d) vs NYY /wo TRIM(%d) + NYN(%d) + NNN(%d) + NYY TRIM(%d) + NOT EVAL(%d)\n\n",
+                        $num_insertions,
+                        $num_nyys_insertion_local - $num_nyys_insertion_local_prev,
+                        $num_nyns_insertion_local - $num_nyns_insertion_local_prev,
+                        $num_nnns_insertion_local - $num_nnns_insertion_local_prev,
+                        $num_nyys_insertion_trim_local - $num_nyys_insertion_trim_local_prev,
+                        $num_not_evaluated_insertion_local - $num_not_evaluated_insertion_local_prev;
+                     print "$alignment_best_for_insertion\n";
+                     exit;
+                  }
+               }
+
+               # deletion
+               if ($num_deletions > 0) {
+                  if ($num_deletions !=
+                      (($num_nyys_deletion_local - $num_nyys_deletion_local_prev) +
+                       ($num_nyns_deletion_local - $num_nyns_deletion_local_prev) +
+                       ($num_nnns_deletion_local - $num_nnns_deletion_local_prev) +
+                       ($num_nyys_deletion_trim_local - $num_nyys_deletion_trim_local_prev) +
+                       ($num_not_evaluated_deletion_local - $num_not_evaluated_deletion_local_prev))) {
+                     printf "\nERROR: $line_org_header2\nD TOTAL(%d) vs NYY /wo TRIM(%d) + NYN(%d) + NNN(%d) + NYY TRIM(%d) + NOT EVAL(%d)\n\n",
+                        $num_deletions,
+                        $num_nyys_deletion_local - $num_nyys_deletion_local_prev,
+                        $num_nyns_deletion_local - $num_nyns_deletion_local_prev,
+                        $num_nnns_deletion_local - $num_nnns_deletion_local_prev,
+                        $num_nyys_deletion_trim_local - $num_nyys_deletion_trim_local_prev,
+                        $num_not_evaluated_deletion_local - $num_not_evaluated_deletion_local_prev;
+                     print "$alignment_best\n";
+                     exit;
+                  }
+               }
+            }
+         }
+
+         # read the 3rd/4th lines of the fastq files
+         # unused lines
+         if ($org_fastq_input == 1) {
+            $line_org_read1 = <$fh_org_read1>;
+            $line_org_read1 = <$fh_org_read1>;
+            unless (defined($line_org_read1)) {
+               die "\nERROR: The number of reads in $in_org_fastq1_file is not matched with $in_location_file\n\n";
+            }
+
+            if ($is_paired) {
+               $line_org_read2 = <$fh_org_read2>;
+               $line_org_read2 = <$fh_org_read2>;
+               unless (defined($line_org_read2)) {
+                  die "\nERROR: The number of reads in $in_org_fastq2_file is not matched with $in_location_file\n\n";
+               }
+            }
+         }
+
+         # read the 3rd/4th lines of the fastq files
+         # unused lines
+         if ($cor_fastq_input == 1) {
+            $line_cor_read1 = <$fh_cor_read1>;
+            $line_cor_read1 = <$fh_cor_read1>;
+            unless (defined($line_cor_read1)) {
+               die "\nERROR: The number of reads in $in_cor_fastq1_file is not matched with $in_location_file\n\n";
+            }
+
+            if ($is_paired) {
+               $line_cor_read2 = <$fh_cor_read2>;
+               $line_cor_read2 = <$fh_cor_read2>;
+               unless (defined($line_cor_read2)) {
+                  die "\nERROR: The number of reads in $in_cor_fastq2_file is not matched with $in_location_file\n\n";
+               }
+            }
+         }
+      }
+      #
+      # read for other cores
+      # skip lines
+      #
+      else {
+         # second location line
+         if ($is_paired) {
+            $line_location = <$fh_location>;
+         }
+
+         # error-free files
+         $line_error_free_read1 = <$fh_error_free_read1>;
+         $line_error_free_read1 = <$fh_error_free_read1>;
+
+         if ($is_paired) {
+            $line_error_free_read2 = <$fh_error_free_read2>;
+            $line_error_free_read2 = <$fh_error_free_read2>;
+         }
+
+         # original fastq files
+         if ($org_fastq_input == 1) {
+            $line_org_read1 = <$fh_org_read1>;
+            $line_org_read1 = <$fh_org_read1>;
+            $line_org_read1 = <$fh_org_read1>;
+            $line_org_read1 = <$fh_org_read1>;
+
+            if ($is_paired) {
+               $line_org_read2 = <$fh_org_read2>;
+               $line_org_read2 = <$fh_org_read2>;
+               $line_org_read2 = <$fh_org_read2>;
+               $line_org_read2 = <$fh_org_read2>;
+            }
+         }
+         # original fasta files
+         else {
+            $line_org_read1 = <$fh_org_read1>;
+            $line_org_read1 = <$fh_org_read1>;
+
+            if ($is_paired) {
+               $line_org_read2 = <$fh_org_read2>;
+               $line_org_read2 = <$fh_org_read2>;
+            }
+         }
+
+         # corrected fastq files
+         if ($cor_fastq_input == 1) {
+            $line_cor_read1 = <$fh_cor_read1>;
+            $line_cor_read1 = <$fh_cor_read1>;
+            $line_cor_read1 = <$fh_cor_read1>;
+            $line_cor_read1 = <$fh_cor_read1>;
+
+            if ($is_paired) {
+               $line_cor_read2 = <$fh_cor_read2>;
+               $line_cor_read2 = <$fh_cor_read2>;
+               $line_cor_read2 = <$fh_cor_read2>;
+               $line_cor_read2 = <$fh_cor_read2>;
+            }
+         }
+         # corrected fasta files
+         else {
+            $line_cor_read1 = <$fh_cor_read1>;
+            $line_cor_read1 = <$fh_cor_read1>;
+
+            if ($is_paired) {
+               $line_cor_read2 = <$fh_cor_read2>;
+               $line_cor_read2 = <$fh_cor_read2>;
+            }
+         }
+      }
+
+      $num_lines++;
+   }
+
+   # check if the read files still have lines
+   my $line_tmp;
+
+   $line_tmp = <$fh_error_free_read1>;
+   if (defined($line_tmp)) {
+      die "\nERROR: Number of lines in the location file is not matched with that in the error-free read\n\n";
+   }
+
+   $line_tmp = <$fh_org_read1>;
+   if (defined($line_tmp)) {
+      die "\nERROR: Number of lines in the location file is not matched with that in the original read (3)\n\n";
+   }
+
+   $line_tmp = <$fh_cor_read1>;
+   if (defined($line_tmp)) {
+      die "\nERROR: Number of lines in the location file is not matched with that in the corrected read (3)\n\n";
+   }
+
+   if ($is_paired) {
+      $line_tmp = <$fh_error_free_read2>;
+      if (defined($line_tmp)) {
+         die "\nERROR: Number of lines in the location file is not matched with that in the error-free read\n\n";
+      }
+
+      $line_tmp = <$fh_org_read2>;
+      if (defined($line_tmp)) {
+         die "\nERROR: Number of lines in the location file is not matched with that in the original read (4)\n\n";
+      }
+
+      $line_tmp = <$fh_cor_read2>;
+      if (defined($line_tmp)) {
+         die "\nERROR: Number of lines in the location file is not matched with that in the corrected read (4)\n\n";
+      }
+   }
+
+   # close files
+   close $fh_location;
+   close $fh_error_free_read1;
+   close $fh_org_read1;
+   close $fh_cor_read1;
+
+   if ($is_paired) {
+      close $fh_error_free_read2;
+      close $fh_org_read2;
+      close $fh_cor_read2;
+   }
+
+   if (defined($in_debug_prefix)) {
+      close $fh_debug_substitution_yyn;
+      #close $fh_debug_substitution_yny;
+      #close $fh_debug_substitution_nyy;
+      close $fh_debug_substitution_nyn;
+      close $fh_debug_substitution_nnn;
+
+      close $fh_debug_insertion_yyn;
+      close $fh_debug_insertion_nyy;
+      close $fh_debug_insertion_nyn;
+      close $fh_debug_insertion_nnn;
+
+      close $fh_debug_deletion_yyn;
+      close $fh_debug_deletion_nyy;
+      close $fh_debug_deletion_nyn;
+      close $fh_debug_deletion_nnn;
+   }
+
+   # copy $position_vector_local to @position_array_local
+   # copy $corrected_position_vector_local to @corrected_position_array_local
+   for (my $i = 0; $i <= $max_read_length; $i++) {
+      $position_array_local[$i]           = evaluate::intp_getitem($position_vector_local, $i); 
+      $corrected_position_array_local[$i] = evaluate::intp_getitem($corrected_position_vector_local, $i); 
+   }
+
+   # wait until all the processors finish calculating local sums
+   MPI_Barrier(MPI_COMM_WORLD);
+
+   # calculate total sums
+   $num_yyns_substitution = MPI_Reduce($num_yyns_substitution_local, sub {$_[0] + $_[1]}, MPI_COMM_WORLD);
+   $num_ynys_substitution = MPI_Reduce($num_ynys_substitution_local, sub {$_[0] + $_[1]}, MPI_COMM_WORLD);
+   $num_nyys_substitution = MPI_Reduce($num_nyys_substitution_local, sub {$_[0] + $_[1]}, MPI_COMM_WORLD);
+   $num_nyns_substitution = MPI_Reduce($num_nyns_substitution_local, sub {$_[0] + $_[1]}, MPI_COMM_WORLD);
+   $num_nnns_substitution = MPI_Reduce($num_nnns_substitution_local, sub {$_[0] + $_[1]}, MPI_COMM_WORLD);
+
+   $num_yyns_insertion = MPI_Reduce($num_yyns_insertion_local, sub {$_[0] + $_[1]}, MPI_COMM_WORLD);
+   $num_nyys_insertion = MPI_Reduce($num_nyys_insertion_local, sub {$_[0] + $_[1]}, MPI_COMM_WORLD);
+   $num_nyns_insertion = MPI_Reduce($num_nyns_insertion_local, sub {$_[0] + $_[1]}, MPI_COMM_WORLD);
+   $num_nnns_insertion = MPI_Reduce($num_nnns_insertion_local, sub {$_[0] + $_[1]}, MPI_COMM_WORLD);
+
+   $num_yyns_deletion = MPI_Reduce($num_yyns_deletion_local, sub {$_[0] + $_[1]}, MPI_COMM_WORLD);
+   $num_nyys_deletion = MPI_Reduce($num_nyys_deletion_local, sub {$_[0] + $_[1]}, MPI_COMM_WORLD);
+   $num_nyns_deletion = MPI_Reduce($num_nyns_deletion_local, sub {$_[0] + $_[1]}, MPI_COMM_WORLD);
+   $num_nnns_deletion = MPI_Reduce($num_nnns_deletion_local, sub {$_[0] + $_[1]}, MPI_COMM_WORLD);
+
+   $num_not_evaluated_substitution = MPI_Reduce($num_not_evaluated_substitution_local, sub {$_[0] + $_[1]}, MPI_COMM_WORLD);
+   $num_not_evaluated_insertion    = MPI_Reduce($num_not_evaluated_insertion_local, sub {$_[0] + $_[1]}, MPI_COMM_WORLD);
+   $num_not_evaluated_deletion     = MPI_Reduce($num_not_evaluated_deletion_local, sub {$_[0] + $_[1]}, MPI_COMM_WORLD);
+
+   $num_from_substitution_to_deletion = MPI_Reduce($num_from_substitution_to_deletion_local, sub {$_[0] + $_[1]}, MPI_COMM_WORLD);
+
+   $num_nyys_substitution_trim = MPI_Reduce($num_nyys_substitution_trim_local, sub {$_[0] + $_[1]}, MPI_COMM_WORLD);
+
+   $num_nyys_insertion_trim = MPI_Reduce($num_nyys_insertion_trim_local, sub {$_[0] + $_[1]}, MPI_COMM_WORLD);
+
+   $num_nyys_deletion_trim = MPI_Reduce($num_nyys_deletion_trim_local, sub {$_[0] + $_[1]}, MPI_COMM_WORLD);
+
+   $total_substitutions = MPI_Reduce($total_substitutions_local, sub {$_[0] + $_[1]}, MPI_COMM_WORLD);
+   $total_insertions    = MPI_Reduce($total_insertions_local, sub {$_[0] + $_[1]}, MPI_COMM_WORLD);
+   $total_deletions     = MPI_Reduce($total_deletions_local, sub {$_[0] + $_[1]}, MPI_COMM_WORLD);
+
+   $num_trimmed_bases = MPI_Reduce($num_trimmed_bases_local, sub {$_[0] + $_[1]}, MPI_COMM_WORLD);
+
+   for (my $i = 0; $i <= $max_read_length; $i++) {
+      $position_array[$i]           = MPI_Reduce($position_array_local[$i],           sub {$_[0] + $_[1]}, MPI_COMM_WORLD);
+      $position_array_corrected[$i] = MPI_Reduce($corrected_position_array_local[$i], sub {$_[0] + $_[1]}, MPI_COMM_WORLD);
+   }
+
+   # find the maximum index of @position_array
+   $max_read_length_real = $max_read_length;
+
+   for (my $i = $max_read_length; $i >= 1; $i--) {
+      if ($position_array[$i] > 0) {
+         $max_read_length_real = $i;
+         last;
+      }
+   }
+
+   # every entry has 0
+   if ($max_read_length_real == $max_read_length) {
+      if ($position_array[$max_read_length_real] == 0) {
+         $max_read_length_real = 0;
+      }
+   }
+
+   #--------------------------------------------------
+   # print final statistics
+   #--------------------------------------------------
+   #
+   # accuracy
+   #
+   if ($rank == 0) {
+      print  "     -------------------------------------------------------\n";
+      print  "     1. Accuracy\n";
+      print  "     -------------------------------------------------------\n";
+
+      #----------------------------------------------------------------------
+      #                                 |               Prediction
+      #                                 -------------------------------------
+      #                                 | Erroneous Base    | Error-free Base
+      #                                 | (Correct Base: X) |
+      #----------------------------------------------------------------------
+      #         | Erroneous Base        |       NYY         |      NNN
+      #         | (Correct Base: X)     |                   |
+      #         | -----------------------------------------------------------
+      # Results | Erroneous Base        |       NYN         |      NNN
+      #         | (Correct Base: not X) |                   |
+      #         | -----------------------------------------------------------
+      #         | Error-free Base       |       YYN         |      YNY
+      #         |                       |                   |
+      #----------------------------------------------------------------------
+
+      print "     Total errors in the location file:\n";
+      printf "          Substitutions       : %12d\n", $total_substitutions;
+      printf "          Insertions          : %12d\n", $total_insertions;
+      printf "          Deletions           : %12d\n", $total_deletions;
+
+      #
+      # $num_not_evaluated_* are not subtracted from denominators because poor error tools would have
+      # a large number of $num_not_evaluated_*
+      #
+
+      #----------------------------------------------------------------------
+      # substitution
+      #----------------------------------------------------------------------
+      print "\n";
+      print "     Substitutions:\n";
+      printf "          YYN                 : %12d\n", $num_yyns_substitution;
+      printf "          YNY                 : %12d\n", $num_ynys_substitution;
+      printf "          NYY                 : %12d\n", $num_nyys_substitution + $num_nyys_substitution_trim;
+      printf "               NYY TRIM       : %12d\n", $num_nyys_substitution_trim;
+      printf "          NYN                 : %12d\n", $num_nyns_substitution;
+      printf "          NNN                 : %12d\n", $num_nnns_substitution;
+      printf "          From SUB to DEL     : %12d\n", $num_from_substitution_to_deletion;
+      printf "          Not evaluated       : %12d\n", $num_not_evaluated_substitution;
+
+      # P: erroneous bases in original reads
+      # sensitivity (recall):        TP / P =        TP / (TP + FN) =               NYY / (NYY + (NYN + NNN) - (NOT EVAL))
+      # gain                : (TP - FP) / P = (TP - FP) / (TP + FN) = (NYY - YYN - NYN) / (NYY + (NYN + NNN) - (NOT EVAL))
+      if ((($num_nyys_substitution + $num_nyys_substitution_trim) + ($num_nyns_substitution + $num_nnns_substitution)) != 0) {
+         printf "          Sensitivity (recall): %12.4f\n",
+         ($num_nyys_substitution + $num_nyys_substitution_trim) /
+         (($num_nyys_substitution + $num_nyys_substitution_trim) + ($num_nyns_substitution + $num_nnns_substitution));
+         printf "          Gain                : %12.4f\n",
+         (($num_nyys_substitution + $num_nyys_substitution_trim) - ($num_yyns_substitution + $num_nyns_substitution)) /
+         (($num_nyys_substitution + $num_nyys_substitution_trim) + ($num_nyns_substitution + $num_nnns_substitution));
+      }
+      else {
+         printf "          Sensitivity (recall): %12s\n", "N/A";
+         printf "          Gain                : %12s\n", "N/A";
+      }
+
+      # precision: TP / (TP + FP)
+      if ((($num_nyys_substitution + $num_nyys_substitution_trim) + ($num_yyns_substitution + $num_nyns_substitution)) != 0) {
+         printf "          Precision           : %12.4f\n",
+         ($num_nyys_substitution + $num_nyys_substitution_trim) /
+         (($num_nyys_substitution + $num_nyys_substitution_trim) + ($num_yyns_substitution + $num_nyns_substitution));
+      }
+      else {
+         printf "          Precision           : %12s\n", "N/A";
+      }
+
+      # N: error-free bases in original reads
+      # specificity: TN / N = TN / (FP + TN)
+      if (($num_yyns_substitution + $num_ynys_substitution) != 0) {
+         printf "          Specificity         : %12.4f\n",
+         $num_ynys_substitution /
+         ($num_yyns_substitution + $num_ynys_substitution);
+      }
+      else {
+         printf "          Specificity         : %12s\n", "N/A";
+      }
+
+      # f-score: 2TP / (2TP + FP + FN)
+      if ((2 * ($num_nyys_substitution + $num_nyys_substitution_trim) + ($num_yyns_substitution + $num_nyns_substitution) + ($num_nyns_substitution + $num_nnns_substitution)) != 0) {
+         printf "          F-score             : %12.4f\n",
+         2 * ($num_nyys_substitution + $num_nyys_substitution_trim) /
+         (2 * ($num_nyys_substitution + $num_nyys_substitution_trim) + ($num_yyns_substitution + $num_nyns_substitution) + ($num_nyns_substitution + $num_nnns_substitution));
+      }
+      else {
+         printf "          F-score             : %12s\n", "N/A";
+      }
+
+      #----------------------------------------------------------------------
+      # insertion
+      #----------------------------------------------------------------------
+      print "\n";
+      print "     Insertions:\n";
+      printf "          YYN                 : %12d\n", $num_yyns_insertion;
+      printf "          NYY                 : %12d\n", $num_nyys_insertion + $num_nyys_insertion_trim;
+      printf "               NYY TRIM       : %12d\n", $num_nyys_insertion_trim;
+      printf "          NYN                 : %12d\n", $num_nyns_insertion;
+      printf "          NNN                 : %12d\n", $num_nnns_insertion;
+      printf "          Not evaluated       : %12d\n", $num_not_evaluated_insertion;
+
+      # P: erroneous bases in original reads
+      # sensitivity (recall):        TP / P =        TP / (TP + FN) =               NYY / (NYY + (NYN + NNN) - (NOT EVAL))
+      # gain                : (TP - FP) / P = (TP - FP) / (TP + FN) = (NYY - YYN - NYN) / (NYY + (NYN + NNN) - (NOT EVAL))
+      if ((($num_nyys_insertion + $num_nyys_insertion_trim) + ($num_nyns_insertion + $num_nnns_insertion)) != 0) {
+         printf "          Sensitivity (recall): %12.4f\n",
+         ($num_nyys_insertion + $num_nyys_insertion_trim) /
+         (($num_nyys_insertion + $num_nyys_insertion_trim) + ($num_nyns_insertion + $num_nnns_insertion));
+         printf "          Gain                : %12.4f\n",
+         (($num_nyys_insertion + $num_nyys_insertion_trim) - ($num_yyns_insertion + $num_nyns_insertion)) /
+         (($num_nyys_insertion + $num_nyys_insertion_trim) + ($num_nyns_insertion + $num_nnns_insertion));
+      }
+      else {
+         printf "          Sensitivity (recall): %12s\n", "N/A";
+         printf "          Gain                : %12s\n", "N/A";
+      }
+
+      # precision: TP / (TP + FP)
+      if ((($num_nyys_insertion + $num_nyys_insertion_trim) + ($num_yyns_insertion + $num_nyns_insertion)) != 0) {
+         printf "          Precision           : %12.4f\n",
+         ($num_nyys_insertion + $num_nyys_insertion_trim) /
+         (($num_nyys_insertion + $num_nyys_insertion_trim) + ($num_yyns_insertion + $num_nyns_insertion));
+      }
+      else {
+         printf "          Precision           : %12s\n", "N/A";
+      }
+
+      # f-score: 2TP / (2TP + FP + FN)
+      if ((2 * ($num_nyys_insertion + $num_nyys_insertion_trim) + ($num_yyns_insertion + $num_nyns_insertion) + ($num_nyns_insertion + $num_nnns_insertion)) != 0) {
+         printf "          F-score             : %12.4f\n",
+         2 * ($num_nyys_insertion + $num_nyys_insertion_trim) /
+         (2 * ($num_nyys_insertion + $num_nyys_insertion_trim) + ($num_yyns_insertion + $num_nyns_insertion) + ($num_nyns_insertion + $num_nnns_insertion));
+      }
+      else {
+         printf "          F-score             : %12s\n", "N/A";
+      }
+
+      #----------------------------------------------------------------------
+      # deletion
+      #----------------------------------------------------------------------
+      print "\n";
+      print "     Deletions:\n";
+      printf "          YYN                 : %12d\n", $num_yyns_deletion;
+      printf "          NYY                 : %12d\n", $num_nyys_deletion + $num_nyys_deletion_trim;
+      printf "               NYY TRIM       : %12d\n", $num_nyys_deletion_trim;
+      printf "          NYN                 : %12d\n", $num_nyns_deletion;
+      printf "          NNN                 : %12d\n", $num_nnns_deletion;
+      printf "          Not evaluated       : %12d\n", $num_not_evaluated_deletion;
+
+      # P: erroneous bases in original reads
+      # sensitivity (recall):        TP / P =        TP / (TP + FN) =               NYY / (NYY + (NYN + NNN) - (NOT EVAL))
+      # gain                : (TP - FP) / P = (TP - FP) / (TP + FN) = (NYY - YYN - NYN) / (NYY + (NYN + NNN) - (NOT EVAL))
+      if ((($num_nyys_deletion + $num_nyys_deletion_trim) + ($num_nyns_deletion + $num_nnns_deletion)) != 0) {
+         printf "          Sensitivity (recall): %12.4f\n",
+         ($num_nyys_deletion + $num_nyys_deletion_trim) /
+         (($num_nyys_deletion + $num_nyys_deletion_trim) + ($num_nyns_deletion + $num_nnns_deletion));
+         printf "          Gain                : %12.4f\n",
+         (($num_nyys_deletion + $num_nyys_deletion_trim) - ($num_yyns_deletion + $num_nyns_deletion)) /
+         (($num_nyys_deletion + $num_nyys_deletion_trim) + ($num_nyns_deletion + $num_nnns_deletion));
+      }
+      else {
+         printf "          Sensitivity (recall): %12s\n", "N/A";
+         printf "          Gain                : %12s\n", "N/A";
+      }
+
+      # precision: TP / (TP + FP)
+      if ((($num_nyys_deletion + $num_nyys_deletion_trim) + ($num_yyns_deletion + $num_nyns_deletion)) != 0) {
+         printf "          Precision           : %12.4f\n",
+         ($num_nyys_deletion + $num_nyys_deletion_trim) /
+         (($num_nyys_deletion + $num_nyys_deletion_trim) + ($num_yyns_deletion + $num_nyns_deletion));
+      }
+      else {
+         printf "          Precision           : %12s\n", "N/A";
+      }
+
+      # f-score: 2TP / (2TP + FP + FN)
+      if ((2 * ($num_nyys_deletion + $num_nyys_deletion_trim) + ($num_yyns_deletion + $num_nyns_deletion) + ($num_nyns_deletion + $num_nnns_deletion)) != 0) {
+         printf "          F-score             : %12.4f\n",
+         2 * ($num_nyys_deletion + $num_nyys_deletion_trim) /
+         (2 * ($num_nyys_deletion + $num_nyys_deletion_trim) + ($num_yyns_deletion + $num_nyns_deletion) + ($num_nyns_deletion + $num_nnns_deletion));
+      }
+      else {
+         printf "          F-score             : %12s\n", "N/A";
+      }
+
+      print "\n";
+
+      printf "     Trimmed bases            : %12d\n", $num_trimmed_bases;
+
+      #
+      # position
+      #
+      print "\n\n";
+      print "     ---------------------------------------------------------\n";
+      print "     2. Position\n";
+      print "     ---------------------------------------------------------\n";
+      print "          Index        Corrected bases\n";
+      print "          ----------   ---------------------------------------\n";
+
+      for (my $i = 1; $i <= $max_read_length_real; $i++) {
+         if ($position_array[$i] == 0) {
+            printf "          %5d    : %12d out of %12d (%s)\n", $i, 0, 0, "N/A";
+         }
+         else {
+            printf "          %5d    : %12d out of %12d (%5.1f%%)\n", $i, $position_array_corrected[$i], $position_array[$i], 100.0 * $position_array_corrected[$i] / $position_array[$i];
+         }
+      }
+
+      print "\n";
+      print "     Comparing reads: done\n";
+   }
+}
+
+
+#----------------------------------------------------------------------
+# compare_one_read
+#----------------------------------------------------------------------
+sub compare_one_read {
+   # parse arguments
+   my ($line_location, $error_free_read, $corrected_read, $read_length, $original_read) = @_;
+
+   $num_substitutions = 0;
+   $num_insertions    = 0;
+   $num_deletions     = 0;
+
+   # lines that we are interested in
+   # <read name> <ref 1 or 2> <ref name> <strand> <start index> <read length> <substitutions> <insertions> <deletions>
+   # <ref 1 or 2> <ref name> <strand> <start index> are not needed for RNA-seq read evaluation
+   if ($line_location =~ /^(\S+)\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+(\S+)\s+(\S+)\s+(\S+)\s*$/) {
+      $read_name    = $1;
+      $substitution = $2;
+      $insertion    = $3;
+      $deletion     = $4;
+
+      #--------------------------------------------------
+      # generate a hash table for substitutions
+      # ref  AAA
+      # read AAC
+      # 3,A->C
+      #--------------------------------------------------
+      my %hash_substitution_org_tmp;
+      my %hash_substitution_err_tmp;
+      %hash_substitution_org = %hash_substitution_org_tmp;
+      %hash_substitution_err = %hash_substitution_err_tmp;
+
+      unless ($substitution eq "-") {
+         while ($substitution =~ /(\d+):([ACGT])\->([ACGT]);/g) {
+            $hash_substitution_org{$1} = $2;
+            $hash_substitution_err{$1} = $3;
+
+            $num_substitutions++;
+         }
+      }
+
+      #--------------------------------------------------
+      # generate a hash table for insertions
+      # inserted to the right of the index
+      # 2,AC
+      # ref  AA--
+      # read AAAC
+      # indices are 1-based but 0 can also be used
+      # when a sequence is inserted to the left of a read
+      # 0,AC
+      # ref  --AA
+      # read ACAA
+      #--------------------------------------------------
+      my %hash_insertion_tmp;
+      %hash_insertion = %hash_insertion_tmp;
+
+      unless ($insertion eq "-") {
+         while ($insertion =~ /(\d+):([ACGT]+);/g) {
+            $hash_insertion{$1} = $2;
+            $num_insertions = $num_insertions + length $2;
+         }
+      }
+
+      #--------------------------------------------------
+      # generate a hash table for deletions
+      # HASH VALUE MIGHT BE WRONG
+      # if the information was made using pirs
+      # however, it is ok because the values will not be used
+      # 3:C;4:G;
+      # ref  AACG
+      # read AA--
+      #--------------------------------------------------
+      my %hash_deletion_tmp;
+      %hash_deletion = %hash_deletion_tmp;
+
+      unless ($deletion eq "-") {
+         while ($deletion =~ /(\d+):([ACGT]);/g) {
+            $hash_deletion{$1} = $2;
+
+            $num_deletions++;
+         }
+      }
+
+      #--------------------------------------------------
+      # a corrected read is same as an original read
+      #--------------------------------------------------
+      if ($corrected_read eq $original_read) {
+         # substitutions
+         if ((scalar keys %hash_substitution_org) > 0) {
+            $num_nnns_substitution_local += $num_substitutions;
+
+            foreach my $each_key (keys %hash_substitution_org) {
+               # update @position_array*
+               evaluate::intp_setitem($position_vector_local, $each_key, evaluate::intp_getitem($position_vector_local, $each_key) + 1);
+            }
+
+            if (defined($in_debug_prefix)) {
+               print $fh_debug_substitution_nnn "\@$read_name\n";
+               print $fh_debug_substitution_nnn "$original_read\n";
+               print $fh_debug_substitution_nnn "$corrected_read\n";
+            }
+         }
+
+         $num_ynys_substitution_local += ($read_length - (scalar keys %hash_substitution_org) - $num_deletions);
+
+         if ((scalar keys %hash_insertion) > 0) {
+            $num_nnns_insertion_local += $num_insertions;
+
+            if (defined($in_debug_prefix)) {
+               print $fh_debug_insertion_nnn "\@$read_name\n";
+               print $fh_debug_insertion_nnn "$original_read\n";
+               print $fh_debug_insertion_nnn "$corrected_read\n";
+            }
+         }
+
+         if ((scalar keys %hash_deletion) > 0) {
+            $num_nnns_deletion_local += $num_deletions;
+
+            if (defined($in_debug_prefix)) {
+               print $fh_debug_deletion_nnn "\@$read_name\n";
+               print $fh_debug_deletion_nnn "$original_read\n";
+               print $fh_debug_deletion_nnn "$corrected_read\n";
+            }
+         }
+      }
+      # a corrected read is not same as an original read
+      else {
+         # non-trimmed read
+         my $is_longer_corrected_read = 0;
+         my $difference = 0;
+
+         if ($is_trimmed == 0) {
+            # handle a corrected read that is longer than an original one
+            if (length($corrected_read) > (length($original_read) + $num_deletions)) {
+               $difference = length($corrected_read) - (length($original_read) + $num_deletions);
+
+               $is_longer_corrected_read = 1;
+            }
+         }
+         # trimmed read
+         else {
+            my $trim_length = length($original_read) - length($corrected_read);
+         }
+
+         #--------------------------------------------------
+         # generate an alignment result
+         # error_free_read: sequence taken from the reference sequence
+         # needleman and wunsch algorithm is too expensive in terms of runtime
+         # use it when it is really needed
+         #--------------------------------------------------
+         # no indel in the original read
+         if (($num_insertions + $num_deletions) == 0) {
+            # no trimmed base
+            # the length of the region where the original read originates == modified read length
+            if ($is_trimmed == 0) {
+               if ($is_longer_corrected_read == 1) {
+                  &evaluate_indel_trim($error_free_read, $corrected_read, $read_length);
+               }
+               else {
+                  &evaluate_substitution($error_free_read, $corrected_read);
+                  $alignment_best = "$error_free_read\n$corrected_read\n";
+               }
+            }
+            # trimmed bases
+            # because there is no insertion and deletion, the two length should be same
+            # if there is no trimmed base
+            else {
+               &evaluate_indel_trim($error_free_read, $corrected_read, $read_length);
+
+            }
+         }
+         # indels in the original read
+         else {
+            &evaluate_indel_trim($error_free_read, $corrected_read, $read_length);
+         }
+
+         # a corrected read is longer than an original read
+         # the outer bases in the corrected read are regarded as insertions
+         if ($is_longer_corrected_read == 1) {
+            $num_yyns_insertion_local += $difference;
+
+            # alignment score is not changed
+            # because the same score is added to every alignment
+         }
+
+         # check the number of processed errors
+         if (defined($in_debug_prefix)) {
+            # substitusion
+            if ($num_yyns_substitution_local_prev < $num_yyns_substitution_local) {
+               print $fh_debug_substitution_yyn "\@$read_name\n";
+               print $fh_debug_substitution_yyn $alignment_best;
+            }
+
+            if ($num_nyns_substitution_local_prev < $num_nyns_substitution_local) {
+               print $fh_debug_substitution_nyn "\@$read_name\n";
+               print $fh_debug_substitution_nyn $alignment_best;
+            }
+
+            if ($num_nnns_substitution_local_prev < $num_nnns_substitution_local) {
+               print $fh_debug_substitution_nnn "\@$read_name\n";
+               print $fh_debug_substitution_nnn $alignment_best;
+            }
+
+            # insertion
+            if ($num_yyns_insertion_local_prev < $num_yyns_insertion_local) {
+               print $fh_debug_insertion_yyn "\@$read_name\n";
+               print $fh_debug_insertion_yyn $alignment_best_for_insertion;
+            }
+
+            if (($num_nyys_insertion_local_prev + $num_nyys_insertion_trim_local_prev) < ($num_nyys_insertion_local + $num_nyys_insertion_trim_local)) {
+               print $fh_debug_insertion_nyy "\@$read_name\n";
+               print $fh_debug_insertion_nyy $alignment_best_for_insertion;
+            }
+
+            if ($num_nyns_insertion_local_prev < $num_nyns_insertion_local) {
+               print $fh_debug_insertion_nyn "\@$read_name\n";
+               print $fh_debug_insertion_nyn $alignment_best_for_insertion;
+            }
+
+            if ($num_nnns_insertion_local_prev < $num_nnns_insertion_local) {
+               print $fh_debug_insertion_nnn "\@$read_name\n";
+               print $fh_debug_insertion_nnn $alignment_best_for_insertion;
+            }
+
+            # deletion
+            if ($num_yyns_deletion_local_prev < $num_yyns_deletion_local) {
+               print $fh_debug_deletion_yyn "\@$read_name\n";
+               print $fh_debug_deletion_yyn $alignment_best;
+            }
+
+            if (($num_nyys_deletion_local_prev + $num_nyys_deletion_trim_local_prev) < ($num_nyys_deletion_local + $num_nyys_deletion_trim_local)) {
+               print $fh_debug_deletion_nyy "\@$read_name\n";
+               print $fh_debug_deletion_nyy $alignment_best;
+            }
+
+            if ($num_nyns_deletion_local_prev < $num_nyns_deletion_local) {
+               print $fh_debug_deletion_nyn "\@$read_name\n";
+               print $fh_debug_deletion_nyn $alignment_best;
+            }
+
+            if ($num_nnns_deletion_local_prev < $num_nnns_deletion_local) {
+               print $fh_debug_deletion_nnn "\@$read_name\n";
+               print $fh_debug_deletion_nnn $alignment_best;
+            }
+         }
+      }
+   }
+   # not aligned read
+   elsif ($line_location =~ /^\S+\s+N\/A\s*$/) {
+      # do nothing
+   }
+   else {
+      die "\nERROR: Illegal line $line_location\n";
+   }
+}
+
+
+#----------------------------------------------------------------------
+# evaluate_indel_trim
+#----------------------------------------------------------------------
+sub evaluate_indel_trim {
+   # pass the variables from the perl variables to the c++ variables
+   $evaluate::deletions             = $deletion;
+   $evaluate::gap_extension_penalty = $in_gap_extension_penalty;
+   $evaluate::gap_opening_penalty   = $in_gap_opening_penalty;
+   $evaluate::insertions            = $insertion;
+   $evaluate::is_detail             = 0;
+   $evaluate::is_trimmed            = $is_trimmed;
+   $evaluate::match_gain            = $in_match_gain;
+   $evaluate::max_candidates        = $in_max_candidates;
+   $evaluate::max_read_length       = $max_read_length;
+   $evaluate::mismatch_penalty      = $in_mismatch_penalty;
+   $evaluate::outer_3_end           = "";
+   $evaluate::outer_5_end           = "";
+   $evaluate::read_length           = $_[2];
+   $evaluate::read_name             = $read_name;
+   $evaluate::string1               = $_[0];
+   $evaluate::string2               = $_[1];
+   $evaluate::substitutions         = $substitution;
+
+   if ($in_penalize_end_gap) {
+      $evaluate::no_end_gap_penalty = 0;
+   }
+   else {
+      $evaluate::no_end_gap_penalty = 1;
+   }
+
+   # initialize c variables
+   evaluate::initialize_variables();
+
+   # decode the error information
+   evaluate::decode_errors();
+
+   # fill the alignment matrixes using dynamic programming
+   evaluate::fill_matrixes();
+
+   # print the matrixes for the debugging purpose
+   #evaluate::print_matrixes();
+
+   # choose the best alignment among the candidtates
+   evaluate::find_best_alignment($position_vector_local, $corrected_position_vector_local);
+
+   # pass the variables from the c++ variables to the perl variables
+   if ($evaluate::too_many_candidates == 0) {
+      $num_yyns_substitution_local             += $evaluate::num_yyns_substitution_local_best;
+      $num_ynys_substitution_local             += $evaluate::num_ynys_substitution_local_best;
+      $num_nyys_substitution_local             += $evaluate::num_nyys_substitution_local_best;
+      $num_nyns_substitution_local             += $evaluate::num_nyns_substitution_local_best;
+      $num_nnns_substitution_local             += $evaluate::num_nnns_substitution_local_best;
+      $num_yyns_insertion_local                += $evaluate::num_yyns_insertion_local_best;
+      $num_nyys_insertion_local                += $evaluate::num_nyys_insertion_local_best;
+      $num_nyns_insertion_local                += $evaluate::num_nyns_insertion_local_best;
+      $num_nnns_insertion_local                += $evaluate::num_nnns_insertion_local_best;
+      $num_yyns_deletion_local                 += $evaluate::num_yyns_deletion_local_best;
+      $num_nyys_deletion_local                 += $evaluate::num_nyys_deletion_local_best;
+      $num_nyns_deletion_local                 += $evaluate::num_nyns_deletion_local_best;
+      $num_nnns_deletion_local                 += $evaluate::num_nnns_deletion_local_best;
+      $num_from_substitution_to_deletion_local += $evaluate::num_from_substitution_to_deletion_local_best;
+      $num_nyys_substitution_trim_local        += $evaluate::num_nyys_substitution_trim_local_best;
+      $num_nyys_insertion_trim_local           += $evaluate::num_nyys_insertion_trim_local_best;
+      $num_nyys_deletion_trim_local            += $evaluate::num_nyys_deletion_trim_local_best;
+
+      $alignment_best               = $evaluate::alignment_best;
+      $alignment_best_for_insertion = $evaluate::alignment_best_for_insertion;
+   }
+   else {
+      $num_not_evaluated_substitution_local += $evaluate::num_not_evaluated_substitution;
+      $num_not_evaluated_insertion_local    += $evaluate::num_not_evaluated_insertion;
+      $num_not_evaluated_deletion_local     += $evaluate::num_not_evaluated_deletion;
+   }
+}
+
+
+#----------------------------------------------------------------------
+# evaluate_substitution
+#----------------------------------------------------------------------
+sub evaluate_substitution {
+   # $i: 1-based
+   for (my $i = 1; $i <= length($_[0]); $i++) {
+      # character in the error-free read
+      # $base1 = $hash_substitution_org{$i}
+      my $base1 = substr($_[0], $i - 1, 1);
+
+      # character in the modified read
+      my $base2 = substr($_[1], $i - 1, 1);
+
+      # $hash_substitution_err{$i} = character in the original read
+
+      # error in the original read (nXX)
+      if (defined($hash_substitution_err{$i})) {
+         # correctly modified
+         if ($base1 eq $base2) {
+            $num_nyys_substitution_local++;
+
+            # update @position_array*
+            evaluate::intp_setitem($position_vector_local,           $i, evaluate::intp_getitem($position_vector_local,           $i) + 1);
+            evaluate::intp_setitem($corrected_position_vector_local, $i, evaluate::intp_getitem($corrected_position_vector_local, $i) + 1);
+         }
+         # not correctly modified
+         else {
+            # not modified
+            if ($base2 eq $hash_substitution_err{$i}) {
+               $num_nnns_substitution_local++;
+
+               # update @position_array*
+               evaluate::intp_setitem($position_vector_local, $i, evaluate::intp_getitem($position_vector_local, $i) + 1);
+            }
+            # modified but the result is wrong
+            else {
+               $num_nyns_substitution_local++;
+
+               # update @position_array*
+               evaluate::intp_setitem($position_vector_local, $i, evaluate::intp_getitem($position_vector_local, $i) + 1);
+            }
+         }
+      }
+      # no error in the original read (yXX)
+      else {
+         if ($base1 eq $base2) {
+            $num_ynys_substitution_local++;
+         }
+         else {
+            $num_yyns_substitution_local++;
+         }
+      }
+   }
+}
+
+
+#----------------------------------------------------------------------
+# check_sequence
+#----------------------------------------------------------------------
+sub check_sequence {
+  my ($seq) = @_;
+
+  $seq = uc $seq;
+
+  my $seq_tmp = $seq;
+
+  # characters in $alphabets
+  $seq_tmp =~ tr/ACGT//d;
+
+   if ($seq_tmp ne "") {
+      die "\nERROR: Illegal characters exist $seq\n\n";
+   }
+   elsif (length($seq) > $max_seq_length) {
+      die "\nERROR: The sequence is too long $seq\n\n";
+   }
+
+   return $seq;
+}

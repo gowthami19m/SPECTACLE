@@ -1,0 +1,202 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use File::Basename;
+use Getopt::Long;
+
+# use the library for version control
+my $directory;
+BEGIN {$directory = dirname $0;} 
+use lib "${directory}/../lib";
+
+if (!-e "${directory}/../lib/version.pm") {
+   die "\nERROR: ${directory}/../lib/version.pm does not exist\n\n";
+}
+use version;
+
+# turn on auto flush
+$| = 1;
+
+my $program_name = basename $0;
+my $date         = $version::date;
+my $version      = $version::version;
+
+my $in_bam_file;
+my $out_bam_file;
+
+my $help;
+
+my $header =
+"
+----------------------------------------------------------------------
+PROGRAM: $program_name
+CONTACT: Yun Heo (yunheo1\@illinois.edu)
+VERSION: $version
+DATE   : $date
+----------------------------------------------------------------------
+\n";
+
+my $usage =
+"USAGE: $program_name <ARGUMENTS>
+
+ARGUMENT          DESCRIPTION                   MANDATORY      DEFAULT
+----------------------------------------------------------------------
+-h                print help                    N
+-in  <file>       input bam file                Y
+-out <file>       output bam file               Y
+----------------------------------------------------------------------
+\n";
+
+
+
+######################################################################
+# main code
+######################################################################
+
+&print_header;
+
+&parse_arguments;
+
+&modify_cigar;
+
+print "\n####################### SUCCESSFULLY COMPLETED #######################\n\n";
+
+######################################################################
+# end of main code
+######################################################################
+
+
+
+#---------------------------------------------------------------------
+# print_header
+#---------------------------------------------------------------------
+sub print_header {
+   print $header;
+}
+
+
+
+#---------------------------------------------------------------------
+# parse_arguments
+#---------------------------------------------------------------------
+sub parse_arguments {
+   my $base_name;
+
+   if (@ARGV == 0) {
+      die $usage;
+   }
+
+   print "Parsing arguments\n";
+
+   if (!GetOptions (
+                    "h"     => \$help,
+                    "in=s"  => \$in_bam_file,
+                    "out=s" => \$out_bam_file,
+                   )
+       or $help) {
+      die $usage;
+   }
+
+   # input bam file
+   if (!defined($in_bam_file)) {
+      die "\nERROR: The input bam file name should be specified\n\n";
+   }
+   elsif (!-e "$in_bam_file") {
+      die "\nERROR: Cannot open $in_bam_file\n\n";
+   }
+
+   # output bam file
+   if (!defined($out_bam_file)) {
+      die "\nERROR: The output bam file name should be specified\n\n";
+   }
+
+   print "     Parsing argumetns: done\n\n";
+}
+
+
+
+#---------------------------------------------------------------------
+# modify_cigar
+#---------------------------------------------------------------------
+sub modify_cigar {
+   print "Modifying CIGAR strings\n";
+
+   open FH_IN, "$in_bam_file"
+      or die "\nERROR: Cannot open $in_bam_file\n\n";
+   open FH_OUT, ">$out_bam_file"
+      or die "\nERROR: Cannot open $out_bam_file\n\n";
+
+   while (my $line = <FH_IN>) {
+      # non-head lines
+      if ($line !~ /^\@/) {
+         # get cigar strings
+         if ($line =~ /^(\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+)(\S+)([\S\s]+)/) {
+            my $prefix  = $1;
+            my $cigar   = $2;
+            my $postfix = $3;
+
+            my $was_prev_op_match = 0;
+            my $new_cigar         = "";
+            my $num_match_prev    = 0;
+
+            # merge M/=/X
+            while ($cigar =~ /(\d+)([MIDNSHP=X])/g) {
+               my $num = $1;
+               my $op  = $2;
+
+               # the current operation is M, I, or X
+               if (($op eq "M") || ($op eq "=") ||($op eq "X")) {
+                  # the previous operation was M, I, or X
+                  if ($was_prev_op_match == 1) {
+                     $num_match_prev += $num;
+                  }
+                  # the previous operation was not M, I, or X
+                  else {
+                     $num_match_prev = $num;
+                     $was_prev_op_match = 1;
+                  }
+               }
+               # the current operation is not M, I, or X
+               else {
+                  # the previous operation was M, I, or X
+                  if ($was_prev_op_match == 1) {
+                     $new_cigar .= $num_match_prev;
+                     $new_cigar .= "M";
+
+                     $was_prev_op_match = 0;
+                  }
+                  # the previous operation was not M, I, or X
+                  # do nothing
+                  #else {
+                  #}
+
+                  $new_cigar .= $num;
+                  $new_cigar .= $op;
+               }
+            }
+
+            # the last operation was M, I, or X
+            if ($was_prev_op_match == 1) {
+               $new_cigar .= $num_match_prev;
+               $new_cigar .= "M";
+            }
+
+# DEBUG
+#print "ORG: $cigar\n";
+#print "MOD: $new_cigar\n\n";
+            $line = $prefix . $new_cigar . $postfix;
+         }
+         else {
+            die "\nERROR: Wrong SAM line $line\n";
+         }
+      }
+
+      print FH_OUT $line;
+   }
+
+   close FH_IN;
+   close FH_OUT;
+
+   print "     Modifying CIGAR strings: done\n";
+}

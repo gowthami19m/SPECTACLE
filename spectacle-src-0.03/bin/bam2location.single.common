@@ -1,0 +1,897 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use File::Basename;
+use Getopt::Long;
+
+# these modules should be installed
+eval {
+   use Bio::DB::Sam;
+};
+if ($@) {
+   die "\nERROR: Module Bio::DB::Sam is not installed\n\n";
+}
+
+eval {
+   use IO::Uncompress::Gunzip qw($GunzipError);
+};
+if ($@) {
+   die "\nERROR: Module IO::Uncompress::Gunzip is not installed\n\n";
+}
+
+eval {
+   use Sys::CPU;
+};
+if ($@) {
+   die "\nERROR: Module Sys::CPU is not installed\n\n";
+}
+
+# use the library for version control
+my $directory;
+BEGIN {$directory = dirname $0;} 
+use lib "${directory}/../lib";
+
+if (!-e "${directory}/../lib/version.pm") {
+   die "\nERROR: ${directory}/../lib/version.pm does not exist\n\n";
+}
+use version;
+
+# turn on auto flush
+$| = 1;
+
+my $program_name                = basename $0;
+my $date                        = $version::date;
+my $version                     = $version::version;
+my $flag_aligned_pair           = 0x0002;
+my $flag_not_primary            = 0x0100;
+my $flag_first_read             = 0x0040;
+my $flag_second_read            = 0x0080;
+my $total_num_substitutions     = 0;
+my $total_num_insertions        = 0;
+my $total_num_deletions         = 0;
+my $total_num_insertions_merged = 0;
+my $total_num_deletions_merged  = 0;
+my $write_order_binary          = "write-order-file.from-fastq.to-fasta.single.common";
+my $max_threads_for_sorting     = 8;
+
+my $num_insertions;
+my $num_deletions;
+
+my $in_bam_file;
+my $in_prefix;
+my $in_fastq;
+my $in_tmp_dir;
+my $in_softclip;
+my $in_ref;
+my $in_error_free;
+my $in_num_threads;
+
+my $out_order_file;
+my $out_sorted_order_file;
+my $out_location_file;
+my $out_error_free_fasta;
+my $out_location_file_tmp;
+my $out_location_file_sorted_tmp;
+my $out_error_free_fasta_tmp;
+
+my $help;
+my $error_free_seq;
+my $list_substitutions;
+my $list_insertions;
+my $list_deletions;
+
+my $hash_ref_index = 0;
+
+my %hash_ref;
+my %hash_ref_name_to_index;
+my %hash_ref_index_to_name;
+
+my $header =
+"
+----------------------------------------------------------------------
+PROGRAM: $program_name
+CONTACT: Yun Heo (yunheo1\@illinois.edu)
+VERSION: $version
+DATE   : $date
+----------------------------------------------------------------------
+\n";
+
+my $usage =
+"USAGE: $program_name <ARGUMENTS>
+
+ARGUMENT          DESCRIPTION                   MANDATORY      DEFAULT
+----------------------------------------------------------------------
+-h                print help                    N
+-bam    <file>    input bam file                Y
+-errorfree        generate error-free fasta     N
+-prefix <string>  output file prefix            Y
+-q      <file>    input fastq file              Y
+-ref    <file>    reference fasta file          N
+-softclip         soft clipping -> insertions   N
+-thread <num>     number of threads for sorting N              # cores
+-tmp    <dir>     tmp directory for sorting     N
+----------------------------------------------------------------------
+\n";
+
+
+
+######################################################################
+# main code
+######################################################################
+
+&print_header;
+
+&parse_arguments;
+
+if (defined($in_ref)) {
+   &read_reference;
+}
+
+&convert_bam_to_location;
+
+&write_order_file;
+
+&reorder_output_files;
+
+&fill_lines_for_unaligned_reads;
+
+print "\n####################### SUCCESSFULLY COMPLETED #######################\n\n";
+
+######################################################################
+# end of main code
+######################################################################
+
+
+
+#---------------------------------------------------------------------
+# print_header
+#---------------------------------------------------------------------
+sub print_header {
+   print $header;
+}
+
+
+
+#---------------------------------------------------------------------
+# parse_arguments
+#---------------------------------------------------------------------
+sub parse_arguments {
+   my $base_name;
+
+   if (@ARGV == 0) {
+      die $usage;
+   }
+
+   print "Parsing arguments\n";
+
+   if (!GetOptions (
+                    "bam=s"     => \$in_bam_file,
+                    "errorfree" => \$in_error_free,
+                    "h"         => \$help,
+                    "prefix=s"  => \$in_prefix,
+                    "q=s"       => \$in_fastq,
+                    "ref=s"     => \$in_ref,
+                    "softclip"  => \$in_softclip,
+                    "tmp=s"     => \$in_tmp_dir,
+                   )
+       or $help) {
+      die $usage;
+   }
+
+   # bam file
+   if (!defined($in_bam_file)) {
+      die "\nERROR: The input bam file name should be specified\n\n";
+   }
+   elsif (!-e "$in_bam_file") {
+      die "\nERROR: Cannot open $in_bam_file\n\n";
+   }
+
+   # original fastq
+   if (!defined($in_fastq)) {
+      die "\nERROR: The input forward fastq file name should be specified\n\n";
+   }
+   elsif (!-e "$in_fastq") {
+      die "\nERROR: Cannot open $in_fastq\n\n";
+   }
+
+   # reference
+   if (defined($in_ref)) {
+      if (!-e "$in_ref") {
+         die "\nERROR: Cannot open $in_ref\n\n";
+      }
+   }
+
+   # prefix
+   if (!defined($in_prefix)) {
+      die "\nERROR: The output file prefix should be specified\n\n";
+   }
+   else {
+      $out_order_file               = $in_prefix . ".order";
+      $out_sorted_order_file        = $in_prefix . ".order.sorted";
+      $out_location_file            = $in_prefix . ".location";
+      $out_error_free_fasta         = $in_prefix . ".error-free.fasta";
+      $out_location_file_tmp        = $in_prefix . ".location.tmp";
+      $out_location_file_sorted_tmp = $in_prefix . ".location.sorted.tmp";
+      $out_error_free_fasta_tmp     = $in_prefix . ".error-free.fasta.tmp";
+   }
+
+   # number of threads
+   if (defined($in_num_threads)) {
+      if ($in_num_threads > $max_threads_for_sorting) {
+         print "     \nWARNING: Using over $max_threads_for_sorting threads for sorting degrades performance; $max_threads_for_sorting threads will be used\n\n";
+         $in_num_threads = $max_threads_for_sorting;
+      }
+   }
+   else {
+      if (Sys::CPU::cpu_count() > $max_threads_for_sorting) {
+         $in_num_threads = $max_threads_for_sorting;
+      }
+      else {
+         $in_num_threads = Sys::CPU::cpu_count();
+      }
+   }
+
+   # tmp directory for sorting
+	if (defined($in_tmp_dir)) {
+      if (!-d $in_tmp_dir) {
+         die "\nERROR: $in_tmp_dir does not exist (or it is not a directory)\n\n";
+      }
+	}
+
+   print "     Parsing argumetns: done\n\n";
+}
+
+
+
+#---------------------------------------------------------------------
+# convert_bam_to_location
+#---------------------------------------------------------------------
+sub convert_bam_to_location {
+   print "Converting bam to location\n";
+
+   open FH_LOCATION, ">$out_location_file_tmp"
+      or die "\nERROR: Cannot open $out_location_file_tmp\n\n";
+
+   my $fh_fasta;
+
+   open $fh_fasta, ">$out_error_free_fasta_tmp"
+      or die "\nERROR: Cannot open $out_error_free_fasta_tmp\n\n";
+
+   my $fh_bam = Bio::DB::Sam->new(-bam => $in_bam_file);
+   my $bam_iterator = $fh_bam->features(-iterator => 1);
+   my $prev_pair_name = "";
+   my $buffer;
+   my $ref_sequence;
+   my $flag_write;
+
+   while (my $each_alignment = $bam_iterator->next_seq) {
+      # the read name of $each_alignment should be different from that of the previous alignment
+      # this means that this program only processes the first pair
+      my $read_name_tmp = $each_alignment->qname;
+      my $flag_no_more_alignment = 0;
+
+      # skip reads with the same name
+      if ($read_name_tmp eq $prev_pair_name) {
+         my $flag_keep_going = 1;
+
+         while ($flag_keep_going == 1) {
+            # fetch a new alignment
+            if ($each_alignment = $bam_iterator->next_seq) {
+               $read_name_tmp = $each_alignment->qname;
+
+               # alignment with a different name
+               if ($read_name_tmp ne $prev_pair_name) {
+                  $flag_keep_going = 0;
+               }
+            }
+            # no more alignment
+            else {
+               $flag_no_more_alignment = 1;
+               $flag_keep_going        = 0;
+            }
+         }
+      }
+      # new name
+      else {
+         $prev_pair_name = $read_name_tmp;
+      }
+
+      # do this only if more alignments exist
+      if ($flag_no_more_alignment == 0) {
+         #--------------------------------------------------
+         # check flags
+         #--------------------------------------------------
+         # $start_* and $end_*: 1-based
+         my $flag        = $each_alignment->flag;
+         my $read_name   = $each_alignment->qname;
+         my $start_index = $each_alignment->start;
+         my $end_index   = $each_alignment->end;
+         my $ref_name    = $each_alignment->seq_id;
+         my $strand      = $each_alignment->strand;
+         my $read_length = length($each_alignment->query->dna);
+
+         # primary alignement?
+         if (($flag & $flag_not_primary) == $flag_not_primary) {
+            die "\nERROR: $read_name is not a primary alignement\n\n";
+         }
+
+         # disabled because all paired 454 reads generated from art comes from the same strand
+         # check strand
+         if ($strand == 1) {
+            $strand = "+";
+         }
+         elsif ($strand == -1) {
+            $strand = "-";
+         }
+         else {
+            die "\nERROR: Illegal strand on $read_name\n\n";
+         }
+
+         # no unsupported character
+         my $cigar_str = $each_alignment->cigar_str;
+
+         # substitute soft clippings with insertions
+         if ($in_softclip) {
+            $cigar_str =~ s/^(\d+)S/$1I/;
+            $cigar_str =~ s/(\d+)S$/$1I/;
+         }
+
+         # count the number of insertions/deletions (merged)
+         # insertions
+         $buffer =()= $cigar_str =~ /\d+I/g;
+         $total_num_insertions_merged += $buffer;
+
+         # deletioins
+         $buffer =()= $cigar_str =~ /\d+D/g;
+         $total_num_deletions_merged += $buffer;
+
+         my $read_tmp = $each_alignment->query->dna;
+         if (($cigar_str !~ /[SHP=X]/) && ($read_tmp !~ /N/)) {
+            # check whether a corresponding reference sequence has Ns
+            $flag_write = 1;
+
+            if (defined($in_ref)) {
+               $ref_sequence = substr($hash_ref{$ref_name}, $start_index - 1, $end_index - $start_index + 1);
+
+               if ($ref_sequence =~ /N/) {
+                  $flag_write = 0;
+               }
+            }
+
+            if ($flag_write == 1) {
+               #--------------------------------------------------
+               # extract error locations
+               #--------------------------------------------------
+               &extract_error_location($each_alignment);
+   
+               #--------------------------------------------------
+               # write outputs
+               #--------------------------------------------------
+               # write locations
+               # <read name> <ref 1 or 2> <ref name> <strand> <start index> <substitutions> <insertions> <deletions>
+               # <ref 1 or 2>: always 1 for the reads not generate using pIRS
+               print FH_LOCATION "$read_name 1 $ref_name $strand $start_index $read_length $list_substitutions $list_insertions $list_deletions\n";
+   
+               # write error-free reads
+               print $fh_fasta ">${read_name}\n";
+
+               # $fh_fasta1 is needed even when -errorfree option is not used
+               # for reordering
+               if (defined($in_error_free)) {
+                  print $fh_fasta "$error_free_seq\n";
+               }
+               else {
+                  print $fh_fasta "\n";
+               }
+            }
+         }
+      }
+   }
+
+   close FH_LOCATION;
+   close $fh_fasta;
+
+   # total number of errors
+   printf "     Total number of substitutions         : %11d\n", $total_num_substitutions;
+   printf "     Total number of insertions            : %11d\n", $total_num_insertions_merged;
+   printf "     Total number of deletions             : %11d\n", $total_num_deletions_merged;
+   printf "     Total number of insertions (separated): %11d\n", $total_num_insertions;
+   printf "     Total number of deletions (separated) : %11d\n", $total_num_deletions;
+
+   print "     Converting bam to location: done\n\n";
+}
+
+
+
+#---------------------------------------------------------------------
+# extract_error_location
+#---------------------------------------------------------------------
+sub extract_error_location {
+   # check the number of arguments
+   my $num_arguments = 1; 
+   my $function_name = "extract_error_location";
+   if (@_ != $num_arguments) {
+      die "\nERROR: The number of argumetns of $function_name should be $num_arguments\n\n";
+   }
+
+   my $each_alignment = $_[0];
+
+   my $flag        = $each_alignment->flag;
+   my $cigar_str   = $each_alignment->cigar_str;
+   my $cigar_array = $each_alignment->cigar_array;
+   my $n_cigar     = $each_alignment->n_cigar;
+   my $strand      = $each_alignment->strand;
+
+   my ($align1, $tmp, $align2) = $each_alignment->padded_alignment;
+
+   # take reverse complement if the strand is "-"
+   if ($strand == -1) {
+      $align1 = reverse $align1;
+      $align1 =~ s/A/A_/g;
+      $align1 =~ s/C/C_/g;
+      $align1 =~ s/G/G_/g;
+      $align1 =~ s/T/T_/g;
+      $align1 =~ s/A_/T@/g;
+      $align1 =~ s/C_/G@/g;
+      $align1 =~ s/G_/C@/g;
+      $align1 =~ s/T_/A@/g;
+      $align1 =~ s/@//g;
+
+      $align2 = reverse $align2;
+      $align2 =~ s/A/A_/g;
+      $align2 =~ s/C/C_/g;
+      $align2 =~ s/G/G_/g;
+      $align2 =~ s/T/T_/g;
+      $align2 =~ s/A_/T@/g;
+      $align2 =~ s/C_/G@/g;
+      $align2 =~ s/G_/C@/g;
+      $align2 =~ s/T_/A@/g;
+      $align2 =~ s/@//g;
+   }
+
+   # remove "-"s generated by Ns from $align2
+   if ($cigar_str =~ /N/) {
+      # 0-based
+      my $current_index = 0;
+
+      my $align2_tmp;
+
+      for (my $i = 0; $i < $n_cigar; $i++) {
+         # M or I or D
+         if ($cigar_array->[$i]->[0] ne "N") {
+            $align2_tmp .= substr($align2, $current_index, $cigar_array->[$i]->[1]);
+         }
+
+         $current_index += $cigar_array->[$i]->[1];
+      }
+
+      $align2 = $align2_tmp;
+   }
+
+   #--------------------------------------------------
+   # insertion
+   #--------------------------------------------------
+   # $align1 = "AAA---AAA";
+   # $align2 = "AAACCCAAA";
+   # /[\-]+/
+   # $-[0] : 3 (0-based)
+   # $+[0] : 6 (0-based, not 5)
+   # output: 3:CCC; (1-based)
+   #--------------------------------------------------
+   my $index_adjust = 0; 
+
+   $num_insertions  = 0;
+   $list_insertions = "";
+
+   while ($align1 =~ /[\-]+/g) {
+      my $length         = $+[0] - $-[0];
+      my $index          = $-[0] - $index_adjust;
+      my $inserted_bases = substr($align2, $-[0], $length);
+      
+      $list_insertions .= "${index}:${inserted_bases};";
+
+      $index_adjust   += $length;
+      $num_insertions += $length;
+   }
+
+   # no insertion
+   if ($num_insertions == 0) {
+      $list_insertions = "-";
+   }
+   else {
+      $total_num_insertions += $num_insertions;
+   }
+
+   #--------------------------------------------------
+   # generate strings for counting deletions and substitutions
+   # $align1_no_i: removing all "-"s from $align1
+   # $align2_no_i: removing all the inserted bases from $align2
+   #--------------------------------------------------
+   my $align1_no_i = "";
+   my $align2_no_i = "";
+
+   for (my $i = 0; $i < length($align1); $i++) {
+      my $base1 = substr($align1, $i, 1);
+
+      if ($base1 ne "-") {
+         $align1_no_i = $align1_no_i . $base1;
+         $align2_no_i = $align2_no_i . substr($align2, $i, 1);
+      }
+   }
+
+   #--------------------------------------------------
+   # substitution
+   # $align1_no_i: AAAAAAA
+   # $align2_no_i: AAAACAA
+   # output      : 5:A->C;
+   #--------------------------------------------------
+   # deletion
+   # $align1_no_i: AAAACAA
+   # $align2_no_i: AAAA-AA
+   # output      : 5:C;
+   #--------------------------------------------------
+   my $num_substitutions = 0;
+
+   $num_deletions      = 0;
+   $list_substitutions = "";
+   $list_deletions     = "";
+
+   for (my $i = 0; $i < length($align1_no_i); $i++) {
+      my $base1 = substr($align1_no_i, $i, 1);
+      my $base2 = substr($align2_no_i, $i, 1);
+
+      # deletion
+      if ($base2 eq "-") {
+         my $index = $i + 1;
+
+         $list_deletions .= "${index}:${base1};";
+         $num_deletions++;
+      }
+      # substitution
+      elsif ($base1 ne $base2) {
+         my $index = $i + 1;
+
+         $list_substitutions .= "${index}:${base1}->${base2};";
+         $num_substitutions++;
+      }
+   }
+
+   # no substitution
+   if ($num_substitutions == 0) {
+      $list_substitutions = "-";
+   }
+   else {
+      $total_num_substitutions += $num_substitutions;
+   }
+
+   # no deletion
+   if ($num_deletions == 0) {
+      $list_deletions = "-";
+   }
+   else {
+      $total_num_deletions += $num_deletions;
+   }
+
+   $error_free_seq = $align1_no_i;
+}
+
+
+
+#---------------------------------------------------------------------
+# write_order_file
+#---------------------------------------------------------------------
+sub write_order_file {
+   print "Extracting the order of input reads\n";
+
+   if (!-e "${directory}/${write_order_binary}") {
+      die "\nERROR: ${directory}/${write_order_binary} does not exist\n\n";
+   }
+
+   my $log = system("${directory}/${write_order_binary} $in_fastq $out_error_free_fasta_tmp $out_order_file");
+   if ($log != 0) {
+      die "ERROR: ${write_order_binary} is not successfully finished\n\n";
+   }
+
+   if (!-e $out_order_file) {
+      die "\nERROR: $out_order_file is not generated\n\n";
+   }
+
+   print "     Extracting the order of input reads: done\n\n";
+}
+
+
+
+#---------------------------------------------------------------------
+# reorder_output_files
+#---------------------------------------------------------------------
+sub reorder_output_files {
+   print "Reordering output files\n";
+
+   # check whether sort support multithreads
+   my $check_log;
+   my $support_parallel;
+
+   $check_log        = `sort --parallel 2>&1`;
+   $support_parallel = 0;
+
+   if ($check_log =~ /requires an argument/) {
+      $support_parallel = 1;
+   }
+
+   my $cmd;
+
+   # set shell variables
+   $ENV{bam2location_order} = $out_order_file;
+   $ENV{bam2location_core}  = $in_num_threads;
+
+   # error-free read file
+   if (defined($in_error_free)) {
+      $ENV{bam2location_input}  = $out_error_free_fasta_tmp;
+      $ENV{bam2location_output} = $out_error_free_fasta;
+      print "     Reordering forward error-free reads";
+      if (defined($in_tmp_dir)) {
+         $ENV{bam2location_tmp} = $in_tmp_dir;
+         if ($support_parallel == 1) {
+            $cmd = q{awk '{printf("%s%s", $0, (NR % 2 == 0) ? "\n" : "\v")}' $bam2location_input | paste $bam2location_order - | sort --parallel=$bam2location_core -T $bam2location_tmp -k1 -n | cut -f 2- |  tr "\v" "\n" > $bam2location_output};
+         }
+         else {
+            $cmd = q{awk '{printf("%s%s", $0, (NR % 2 == 0) ? "\n" : "\v")}' $bam2location_input | paste $bam2location_order - | sort -T $bam2location_tmp -k1 -n | cut -f 2- |  tr "\v" "\n" > $bam2location_output};
+         }
+      }
+      else {
+         if ($support_parallel == 1) {
+            $cmd = q{awk '{printf("%s%s", $0, (NR % 2 == 0) ? "\n" : "\v")}' $bam2location_input | paste $bam2location_order - | sort --parallel=$bam2location_core -k1 -n | cut -f 2- |  tr "\v" "\n" > $bam2location_output};
+         }
+         else {
+            $cmd = q{awk '{printf("%s%s", $0, (NR % 2 == 0) ? "\n" : "\v")}' $bam2location_input | paste $bam2location_order - | sort -k1 -n | cut -f 2- |  tr "\v" "\n" > $bam2location_output};
+         }
+      }
+      system($cmd);
+      print ": done\n";
+   }
+
+   # location file
+   $ENV{bam2location_input}  = $out_location_file_tmp;
+   $ENV{bam2location_output} = $out_location_file_sorted_tmp;
+   print "     Reordering locations";
+   if (defined($in_tmp_dir)) {
+      $ENV{bam2location_tmp} = $in_tmp_dir;
+      if ($support_parallel == 1) {
+         $cmd = q{cat $bam2location_input | paste $bam2location_order - | sort --parallel=$bam2location_core -T $bam2location_tmp -k1 -n | cut -f 2- |  tr "\v" "\n" > $bam2location_output};
+      }
+      else {
+         $cmd = q{cat $bam2location_input | paste $bam2location_order - | sort -T $bam2location_tmp -k1 -n | cut -f 2- |  tr "\v" "\n" > $bam2location_output};
+      }
+   }
+   else {
+      if ($support_parallel == 1) {
+         $cmd = q{cat $bam2location_input | paste $bam2location_order - | sort --parallel=$bam2location_core -k1 -n | cut -f 2- |  tr "\v" "\n" > $bam2location_output};
+      }
+      else {
+         $cmd = q{cat $bam2location_input | paste $bam2location_order - | sort -k1 -n | cut -f 2- |  tr "\v" "\n" > $bam2location_output};
+      }
+   }
+   system($cmd);
+   print ": done\n";
+
+   # generate an sorted order file
+   $ENV{bam2location_input}  = $out_order_file;
+   $ENV{bam2location_output} = $out_sorted_order_file;
+   print "     Reordering the order file";
+   if ($support_parallel == 1) {
+      $cmd = q{sort --parallel=$bam2location_core -n $bam2location_input > $bam2location_output};
+   }
+   else {
+      $cmd = q{sort -n $bam2location_input > $bam2location_output};
+   }
+   system($cmd);
+   print ": done\n";
+
+   # delete temporary files
+   unlink $out_error_free_fasta_tmp;
+   unlink $out_location_file_tmp;
+
+   print "     Reordering output files: done\n\n";
+}
+
+
+
+#---------------------------------------------------------------------
+# fill_lines_for_unaligned_reads
+#---------------------------------------------------------------------
+sub fill_lines_for_unaligned_reads {
+   print "Filling empty lines\n";
+
+   # generate a filled location file
+   open FH_SORTED_ORDER, "$out_sorted_order_file"
+      or die "\nERROR: Cannot open $out_sorted_order_file\n\n";
+   open FH_SORTED_LOCATION_TMP, "$out_location_file_sorted_tmp"
+      or die "\nERROR: Cannot open $out_location_file_sorted_tmp\n\n";
+   open FH_LOCATION, ">$out_location_file"
+      or die "\nERROR: Cannot open $out_location_file\n\n";
+
+   my $fh_fastq;
+
+   if ($in_fastq =~ /\.gz$/) {
+      $fh_fastq = IO::Uncompress::Gunzip->new($in_fastq)
+         or die "\nERROR: Cannot open $in_fastq\n\n";
+   }
+   else {
+      open $fh_fastq, "$in_fastq"
+         or die "\nERROR: Cannot open $in_fastq\n\n";
+   }
+
+   my $prev_order = 0;
+   my $line_fastq;
+   my $read_name_fastq;
+
+   while (my $line_sorted_location_tmp = <FH_SORTED_LOCATION_TMP>) {
+      my $line_sorted_order = <FH_SORTED_ORDER>;
+      my $current_order;
+
+      if ($line_sorted_order =~ /(\d+)/) {
+         $current_order = $1;
+      }
+      else {
+         die "\nERROR: Wrong line in $out_sorted_order_file $line_sorted_order\n\n";
+      }
+
+      #--------------------------------------------------
+      # unaligned reads
+      #--------------------------------------------------
+      for (my $i = 0; $i < ($current_order - $prev_order - 1); $i++) {
+         # forward read
+         $line_fastq = <$fh_fastq>;
+         if (defined($line_fastq)) {
+            if ($line_fastq =~ /^\@(\S+)/) {
+               $read_name_fastq = $1;
+
+               print FH_LOCATION "$read_name_fastq N/A\n";
+            }
+            else {
+               die "\nERROR: The number of lines in $in_fastq is not matched with that in $out_sorted_order_file\n\n";
+            }
+         }
+         else {
+            die "\nERROR: The number of lines in $in_fastq is not matched with that in $out_sorted_order_file\n\n";
+         }
+
+         # skip remaining lines
+         $line_fastq = <$fh_fastq>;
+         $line_fastq = <$fh_fastq>;
+         $line_fastq = <$fh_fastq>;
+      }
+
+      #--------------------------------------------------
+      # aligned reads
+      #--------------------------------------------------
+      my $read_name_location;
+      my $remaining_location;
+
+      # read names in the location file
+      # forward
+      if ($line_sorted_location_tmp =~ /^(\S+)([\s\S]+)/) {
+         $read_name_location = $1;
+         $remaining_location = $2;
+      }
+      else {
+         die "\nERROR: Wrong read name $line_sorted_location_tmp\n\n";
+      }
+
+      # read names in the fastq files
+      my $read_name_fastq;
+
+      my $line_fastq = <$fh_fastq>;
+
+      if ($line_fastq =~ /^\@(\S+)/) {
+         $read_name_fastq = $1;
+      }
+      else {
+         die "\nERROR: Wrong read name $line_fastq\n\n";
+      }
+
+      print FH_LOCATION $read_name_fastq;
+      print FH_LOCATION $remaining_location;
+
+      $prev_order = $current_order;
+
+      # remaining lines in reads
+      $line_fastq = <$fh_fastq>;
+      $line_fastq = <$fh_fastq>;
+      $line_fastq = <$fh_fastq>;
+   }
+
+   #--------------------------------------------------
+   # reads after the last aligned reads
+   #--------------------------------------------------
+   while ($line_fastq = <$fh_fastq>) {
+      # forward read
+      if ($line_fastq =~ /^\@(\S+)/) {
+         $read_name_fastq = $1;
+
+         print FH_LOCATION "$read_name_fastq N/A\n";
+      }
+      else {
+         die "\nERROR: The number of lines in $in_fastq is not matched with that in $out_sorted_order_file\n\n";
+      }
+
+      # skip remaining lines
+      $line_fastq = <$fh_fastq>;
+      $line_fastq = <$fh_fastq>;
+      $line_fastq = <$fh_fastq>;
+   }
+
+   close FH_SORTED_ORDER;
+   close FH_SORTED_LOCATION_TMP;
+   close FH_LOCATION;
+
+   close $fh_fastq;
+
+   unlink $out_location_file_sorted_tmp;
+   unlink $out_order_file;
+   unlink $out_sorted_order_file;
+
+   print "     Filling empty lines: done\n"
+}
+
+
+
+#----------------------------------------------------------------------
+# read_reference
+#----------------------------------------------------------------------
+sub read_reference {
+   # open files
+   my $fh_in;
+   open $fh_in, "$in_ref"
+      or die "\nERROR: Cannot open $in_ref\n\n";
+
+   my $seq_name_reading      = "";
+   my $seq_name_reading_tmp  = "";
+   my $buffer                = "";
+
+   while (my $line = <$fh_in>) {
+      chomp $line;
+
+      if ($line =~ /^>(\S+)/) {
+         $seq_name_reading_tmp = $1;
+
+         # update the hash table
+         # not the first sequence
+         if ($seq_name_reading ne "") {
+            if (length($buffer) > 0) {
+               $hash_ref{$seq_name_reading} = $buffer;
+               $hash_ref_index++;
+               $hash_ref_name_to_index{$seq_name_reading} = $hash_ref_index;
+               $hash_ref_index_to_name{$hash_ref_index} = $seq_name_reading;
+            }
+            else {
+               die "\nERROR: Buffer is empty\n\n";
+            }
+         }
+
+         $seq_name_reading = $seq_name_reading_tmp;
+         $buffer           = "";
+      }
+      elsif ($line =~ /^$/) {
+      }
+      else {
+         $line = uc $line;
+         $buffer = $buffer . $line;
+      }
+   }
+
+   if (length($buffer) > 0) {
+      unless(defined($_[1]{$seq_name_reading})) {
+         $hash_ref{$seq_name_reading} = $buffer;
+         $hash_ref_index++;
+         $hash_ref_name_to_index{$seq_name_reading} = $hash_ref_index;
+         $hash_ref_index_to_name{$hash_ref_index} = $seq_name_reading;
+      }
+      else {
+         die "\nERROR: Same sequence name\n\n";
+      }
+   }
+
+   close $fh_in;
+}

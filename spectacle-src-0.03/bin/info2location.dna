@@ -1,0 +1,462 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use File::Basename;
+use Getopt::Long;
+
+# these modules should be installed
+eval {
+   use IO::Uncompress::Gunzip qw($GunzipError);
+};
+if ($@) {
+   die "\nERROR: Module IO::Uncompress::Gunzip is not installed\n\n";
+}
+
+# use the library for version control
+my $directory;
+BEGIN {$directory = dirname $0;} 
+use lib "${directory}/../lib";
+
+if (!-e "${directory}/../lib/version.pm") {
+   die "\nERROR: ${directory}/../lib/version.pm does not exist\n\n";
+}
+use version;
+
+# turn on auto flush
+$| = 1;
+
+my $program_name = basename $0;
+
+my $date    = $version::date;
+my $version = $version::version;
+my $help;
+
+my $in_info_file;
+my $in_fastq1;
+my $in_fastq2;
+my $out_location_file;
+
+my $header =
+"
+----------------------------------------------------------------------
+PROGRAM: $program_name
+CONTACT: Yun Heo (yunheo1\@illinois.edu)
+VERSION: $version
+DATE   : $date
+----------------------------------------------------------------------
+\n";
+
+my $usage =
+"USAGE: $program_name <ARGUMENTS>
+
+ARGUMENT          DESCRIPTION                MANDATORY         DEFAULT
+----------------------------------------------------------------------
+-h                print help                 N
+-info     <file>  input pirs info file       Y
+-location <file>  output location  file      Y
+-q1       <file>  input fastq file1          Y
+-q2       <file>  input fastq file2          Y
+----------------------------------------------------------------------
+\n";
+
+
+
+######################################################################
+# main code
+######################################################################
+
+&print_header;
+
+&parse_arguments;
+
+&convert_info_to_location;
+
+print "\n####################### SUCCESSFULLY COMPLETED #######################\n\n";
+
+######################################################################
+# end of main code
+######################################################################
+
+
+
+#---------------------------------------------------------------------
+# print_header
+#---------------------------------------------------------------------
+sub print_header {
+   print $header;
+}
+
+
+
+#---------------------------------------------------------------------
+# parse_arguments
+#---------------------------------------------------------------------
+sub parse_arguments {
+   my $base_name;
+
+   if (@ARGV == 0) {
+      die $usage;
+   }
+
+   print "Parsing arguments\n";
+
+   if (!GetOptions (
+                    "h"          => \$help,
+                    "info=s"     => \$in_info_file,
+                    "location=s" => \$out_location_file,
+                    "q1=s"       => \$in_fastq1,
+                    "q2=s"       => \$in_fastq2,
+                   )
+       or $help) {
+      die $usage;
+   }
+
+   # input info file
+   if (!defined($in_info_file)) {
+      die "\nERROR: Input file name should be specified\n\n";
+   }
+   elsif (!-e "$in_info_file") {
+      die "\nERROR: Cannot open $in_info_file\n\n";
+   }
+
+   # output location file
+   if (!defined($out_location_file)) {
+      die "\nERROR: The output location file name should be specified\n\n";
+   }
+
+   # input fastq1 file
+   if (!defined($in_fastq1)) {
+      die "\nERROR: The input fastq1 file name should be specified\n\n";
+   }
+   elsif (!-e "$in_fastq1") {
+      die "\nERROR: Cannot open $in_fastq1\n\n";
+   }
+
+   # input fastq2 file
+   if (!defined($in_fastq2)) {
+      die "\nERROR: The input fastq2 file name should be specified\n\n";
+   }
+   elsif (!-e "$in_fastq2") {
+      die "\nERROR: Cannot open $in_fastq2\n\n";
+   }
+
+   print "     Parsing argumetns: done\n\n";
+}
+
+
+
+#---------------------------------------------------------------------
+# convert_info_to_location
+#---------------------------------------------------------------------
+sub convert_info_to_location {
+   print "Converting into to location\n";
+
+   # open files
+   my $fh_info;
+   if ($in_info_file =~ /\.gz$/) {
+      $fh_info = IO::Uncompress::Gunzip->new($in_info_file)
+         or die "\nERROR: Cannot open $in_info_file\n\n";
+   }
+   else {
+      open $fh_info, "$in_info_file"
+         or die "\nERROR: Cannot open $in_info_file\n\n";
+   }
+
+   open FH_FASTQ1, "$in_fastq1"
+      or die "\nERROR: Cannot open $in_fastq1\n\n";
+   open FH_FASTQ2, "$in_fastq2"
+      or die "\nERROR: Cannot open $in_fastq2\n\n";
+
+   open FH_LOCATION, ">$out_location_file"
+      or die "\nERROR: Cannot open $out_location_file\n\n";
+
+   # iterate reads
+   my %hash_substitution_org;
+   my %hash_substitution_err;
+   my %hash_insertion;
+   my %hash_deletion;
+
+   my $num_lines = 0;
+
+   while (my $line_info = <$fh_info>) {
+      # pirs information line
+      if ($line_info =~ /^(\S+)\s+([12])\s+(\S+)\s+(\d+)\s+([\+\-])\s+\S+\s+\S+\s+(\S+)\s+(\S+)\s+(\S+)/) {
+         my $read_name     = $1;
+         my $ref_1_or_2    = $2;
+         my $ref_name      = $3;
+         my $start_index   = $4;
+         my $strand        = $5;
+         my $substitution  = $6;
+         my $insertion     = $7;
+         my $deletion      = $8;
+
+         # remove "@" from read_name
+         $read_name =~ s/^\@//;
+
+         #--------------------------------------------------
+         # generate a hash table for substitutions
+         # ref  AAA
+         # read AAC
+         # 3,A->C
+         #--------------------------------------------------
+         my %hash_substitution_org_tmp;
+         my %hash_substitution_err_tmp;
+         %hash_substitution_org = %hash_substitution_org_tmp;
+         %hash_substitution_err = %hash_substitution_err_tmp;
+   
+         unless ($substitution eq "-") {
+            while ($substitution =~ /(\d+),([ACGT])\->([ACGT]);/g) {
+               $hash_substitution_org{$1} = $2;
+               $hash_substitution_err{$1} = $3;
+            }
+         }
+
+         my $num_substitutions = (scalar keys %hash_substitution_org);
+   
+         #--------------------------------------------------
+         # generate a hash table for insertions
+         # inserted to the right of the index
+         # 2,AC
+         # ref  AA--
+         # read AAAC
+         # 1 is the smallest number for the reads generated using pirs
+         # insertions that exist to the left of an original read
+         # should be inserted with the index 0
+         # this may be needed if reads are not generated by pirs
+         # and if the reads include such insertions
+         #--------------------------------------------------
+         my $num_insertions = 0;
+
+         my %hash_insertion_tmp;
+         %hash_insertion = %hash_insertion_tmp;
+   
+         unless ($insertion eq "-") {
+            while ($insertion =~ /(\d+),([ACGT]+);/g) {
+               $hash_insertion{$1} = $2;
+               $num_insertions = $num_insertions + length $2;
+            }
+         }
+   
+         #--------------------------------------------------
+         # generate a hash table for deletions
+         # HASH VALUE IS WRONG
+         # but it is ok because the hash values are not used
+         # in the evaluation step
+         # 2,AC (not 3, CG: pirs bug)
+         # ref  AACG
+         # read AA--
+         #--------------------------------------------------
+         my $num_deletions = 0;
+
+         my %hash_deletion_tmp;
+         %hash_deletion = %hash_deletion_tmp;
+   
+         unless ($deletion eq "-") {
+            while ($deletion =~ /(\d+),([ACGT]+);/g) {
+               # adjust the index
+               my $index = $1;
+               my $deleted_bases = $2;
+   
+               $hash_deletion{$index} = $deleted_bases;
+               $num_deletions += (length $deleted_bases);
+            }
+         }
+   
+         #--------------------------------------------------
+         # positions in the infomation file were calculated using indexes based on the original read
+         # the indexes should be converted to the ones based on the reference sequence
+         # -1 for all the errors to the right of an insertion
+         # +1 for all the errors to the right of a deletion
+         # the indexs start from the 5'-end even for the reads from the "-" strand
+         # therefore when you open a read file you can use the indexes without conversion both for the "+" strand and the "-" strand
+         #--------------------------------------------------
+         if (((scalar keys %hash_insertion) + (scalar keys %hash_deletion) > 0) && ((scalar keys %hash_substitution_org) + (scalar keys %hash_insertion) + (scalar keys %hash_deletion) > 1)) {
+            my %hash_substitution_org_tmp_tmp;
+            my %hash_substitution_err_tmp_tmp;
+            my %hash_insertion_tmp_tmp;
+            my %hash_deletion_tmp_tmp;
+
+            # find the maximum index among all the hashes
+            my $max_index = 0;
+            my $max_index_tmp;
+
+            if ($num_substitutions > 0) {
+               $max_index_tmp = (reverse sort {$a <=> $b} keys %hash_substitution_org)[0];
+               if ($max_index_tmp > $max_index) {
+                  $max_index = $max_index_tmp;
+               }
+            }
+
+            if ($num_insertions > 0) {
+               $max_index_tmp = (reverse sort {$a <=> $b} keys %hash_insertion)[0];
+               if ($max_index_tmp > $max_index) {
+                  $max_index = $max_index_tmp;
+               }
+            }
+
+            if ($num_deletions > 0) {
+               $max_index_tmp = (reverse sort {$a <=> $b} keys %hash_deletion)[0];
+               if ($max_index_tmp > $max_index) {
+                  $max_index = $max_index_tmp;
+               }
+            }
+   
+            my $adjust = 0;
+            for (my $i = 1; $i <= $max_index; $i++) {
+               # when both a substitution and an insertion exist in the same index
+               # the index of the substitution is not modified
+               if (defined($hash_substitution_org{$i})) {
+                  $hash_substitution_org_tmp_tmp{$i + $adjust} = $hash_substitution_org{$i};
+                  $hash_substitution_err_tmp_tmp{$i + $adjust} = $hash_substitution_err{$i};
+               }
+   
+               if (defined($hash_insertion{$i})) {
+                  $hash_insertion_tmp_tmp{$i + $adjust} = $hash_insertion{$i};
+                  $adjust = $adjust - length($hash_insertion{$i});
+   
+                  # both an insertion and a deletion exist in the same index
+                  if (defined($hash_deletion{$i})) {
+                     die "\nERROR: Insertion and deletion in $read_name\n\n";
+                  }
+               }
+               elsif (defined($hash_deletion{$i})) {
+                  $hash_deletion_tmp_tmp{$i + $adjust} = $hash_deletion{$i};
+                  #$adjust++;
+                  $adjust += length $hash_deletion{$i};
+               }
+            }
+   
+            %hash_substitution_org = %hash_substitution_org_tmp_tmp;
+            %hash_substitution_err = %hash_substitution_err_tmp_tmp;
+            %hash_insertion        = %hash_insertion_tmp_tmp;
+            %hash_deletion         = %hash_deletion_tmp_tmp;
+         }
+
+         #--------------------------------------------------
+         # expand multiple-length deletions to multiple single-length deletions
+         # hash indexes are adjusted (+1)
+         # hash values are not adjusted because they are not used
+         # 2:AC -> 3:A, 4:C
+         # ref  AACG
+         # read AA--
+         #--------------------------------------------------
+         if ((scalar keys %hash_deletion) > 0) {
+            my %hash_deletion_tmp;
+
+            foreach my $each_key (keys %hash_deletion) {
+               for (my $i = ($each_key + 1); $i < ($each_key + 1 + length($hash_deletion{$each_key})); $i++) {
+                  $hash_deletion_tmp{$i} = substr($hash_deletion{$each_key}, $i - $each_key - 1, 1);
+               }
+            }
+
+            %hash_deletion = %hash_deletion_tmp;
+         }
+
+         #--------------------------------------------------
+         # generate new error strings
+         #--------------------------------------------------
+         # substitution
+         my $new_substitution = "";
+
+         foreach my $each_key (sort {$a <=> $b} keys %hash_substitution_org) {
+            $new_substitution .= "${each_key}:$hash_substitution_org{$each_key}->$hash_substitution_err{$each_key};";
+         }
+
+         if ($num_substitutions == 0) {
+            $new_substitution = "-";
+         }
+
+         # insertion
+         my $new_insertion = "";
+         foreach my $each_key (sort {$a <=> $b} keys %hash_insertion) {
+            $new_insertion .= "${each_key}:$hash_insertion{$each_key};"
+         }
+
+         if ($num_insertions == 0) {
+            $new_insertion = "-";
+         }
+
+         # deletion
+         my $new_deletion = "";
+         foreach my $each_key (sort {$a <=> $b} keys %hash_deletion) {
+            $new_deletion .= "${each_key}:$hash_deletion{$each_key};"
+         }
+
+         if ($num_deletions == 0) {
+            $new_deletion = "-";
+         }
+
+         my $read_length;
+         my $line_tmp1;
+         my $line_tmp2;
+         my $line_tmp3;
+
+         if (($num_lines % 2) == 0) {
+            $line_tmp1 = <FH_FASTQ1>;
+            $line_tmp2 = <FH_FASTQ1>;
+            $line_tmp3 = <FH_FASTQ1>;
+            $line_tmp3 = <FH_FASTQ1>;
+         }
+         else {
+            $line_tmp1 = <FH_FASTQ2>;
+            $line_tmp2 = <FH_FASTQ2>;
+            $line_tmp3 = <FH_FASTQ2>;
+            $line_tmp3 = <FH_FASTQ2>;
+         }
+
+         # compare read names between fastq and info files
+         if ($line_tmp1 =~ /^\@(\S+)/) {
+            my $read_name_tmp = $1;
+
+            if ($read_name_tmp ne $read_name) {
+               die "\nERROR: Read name mismatch $read_name_tmp $read_name\n\n";
+            }
+         }
+         else {
+            die "\nERROR: $line_tmp1\n\n";
+         }
+
+         # read length
+         chomp $line_tmp2;
+         $read_length = length($line_tmp2);
+
+         #**************************************************
+         # THIS IS NEEDED FOR PIRS 1.10
+         #**************************************************
+         # adjust $start_index
+         # pirs 1.10 has a bug in calculating the start indices
+         if ($strand eq "-") {
+            $start_index += (2 * ($num_insertions - $num_deletions));
+         }
+         #**************************************************
+
+         # <read name> <ref 1 or 2> <ref name> <strand> <start index> <read length> <substitutions> <insertions> <deletions>
+         print FH_LOCATION "$read_name $ref_1_or_2 $ref_name $strand $start_index $read_length $new_substitution $new_insertion $new_deletion\n";
+
+         # print log
+         $num_lines++;
+         if ($num_lines % 10000 == 0) {
+            printf "     %12d reads are processed\n", $num_lines;
+         }
+      }
+      # comment lines
+      elsif ($line_info =~ /^#/) {
+         # do nothing
+      }
+      # empty lines
+      elsif ($line_info =~ /^$/) {
+         # do nothing
+      }
+      else {
+         die "\nERROR: Illegal line $line_info\n";
+      }
+   }
+
+   close $fh_info;
+   close FH_FASTQ1;
+   close FH_FASTQ2;
+   close FH_LOCATION;
+
+   print "     Converting into to location: done\n";
+}

@@ -1,0 +1,154 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use File::Basename;
+use Getopt::Long;
+
+# use the library for version control
+my $directory;
+BEGIN {$directory = dirname $0;} 
+use lib "${directory}/../lib";
+
+if (!-e "${directory}/../lib/version.pm") {
+   die "\nERROR: ${directory}/../lib/version.pm does not exist\n\n";
+}
+use version;
+
+# turn on auto flush
+$| = 1;
+
+my $program_name       = basename $0;
+my $date               = $version::date;
+my $version            = $version::version;
+my $generate_map_binary = "generate-map.from-fastq.single.common";
+
+my $in_org_fastq;
+my $in_cor_fastq;
+my $in_tmp_dir;
+
+my $out_map_file;
+
+my $help;
+
+my $header =
+"
+----------------------------------------------------------------------
+PROGRAM: $program_name
+CONTACT: Yun Heo (yunheo1\@illinois.edu)
+VERSION: $version
+DATE   : $date
+----------------------------------------------------------------------
+\n";
+
+my $usage =
+"USAGE: $program_name <ARGUMENTS>
+
+ARGUMENT          DESCRIPTION                      MANDATORY   DEFAULT
+----------------------------------------------------------------------
+-h                print help                       N
+-corfastq  <file> fastq file to be mapped          Y
+-orgfastq <file>  fastq file with a right order    Y
+-outmap   <file>  output map file                  Y
+----------------------------------------------------------------------
+\n";
+
+
+
+######################################################################
+# main code
+######################################################################
+
+&print_header;
+
+&parse_arguments;
+
+&write_map_file;
+
+print "\n####################### SUCCESSFULLY COMPLETED #######################\n\n";
+
+######################################################################
+# end of main code
+######################################################################
+
+
+
+#---------------------------------------------------------------------
+# print_header
+#---------------------------------------------------------------------
+sub print_header {
+   print $header;
+}
+
+
+
+#---------------------------------------------------------------------
+# parse_arguments
+#---------------------------------------------------------------------
+sub parse_arguments {
+   my $base_name;
+
+   if (@ARGV == 0) {
+      die $usage;
+   }
+
+   print "Parsing arguments\n";
+
+   if (!GetOptions (
+                    "h"          => \$help,
+                    "orgfastq=s" => \$in_org_fastq,
+                    "corfastq=s" => \$in_cor_fastq,
+                    "outmap=s"   => \$out_map_file,
+                    "tmp=s"      => \$in_tmp_dir,
+                   )
+       or $help) {
+      die $usage;
+   }
+
+   # original fastq
+   if (!defined($in_org_fastq)) {
+      die "\nERROR: A fastq file with a right order should be specified\n\n";
+   }
+   elsif (!-e "$in_org_fastq") {
+      die "\nERROR: Cannot open $in_org_fastq\n\n";
+   }
+
+   # fastq to be mapped
+   if (!defined($in_cor_fastq)) {
+      die "\nERROR: A fastq file to be mapped should be specified\n\n";
+   }
+   elsif (!-e "$in_cor_fastq") {
+      die "\nERROR: Cannot open $in_cor_fastq\n\n";
+   }
+
+   # output map file
+   if (!defined($out_map_file)) {
+      die "\nERROR: An output map file should be specified\n\n";
+   }
+
+   print "     Parsing argumetns: done\n\n";
+}
+
+
+
+#---------------------------------------------------------------------
+# write_map_file
+#---------------------------------------------------------------------
+sub write_map_file {
+   print "Writing an output map file\n";
+
+   if (!-e "${directory}/${generate_map_binary}") {
+      die "\nERROR: ${directory}/${generate_map_binary} does not exist\n\n";
+   }
+
+   my $log = system("${directory}/${generate_map_binary} $in_org_fastq $in_cor_fastq $out_map_file");
+   if ($log != 0) {
+      die "ERROR: ${generate_map_binary} is not successfully finished\n\n";
+   }
+
+   if (!-e $out_map_file) {
+      die "\nERROR: $out_map_file is not generated\n\n";
+   }
+
+   print "     Writing an output map file: done\n\n";
+}

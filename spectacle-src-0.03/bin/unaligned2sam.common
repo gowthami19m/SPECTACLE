@@ -1,0 +1,849 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use File::Basename;
+use Getopt::Long;
+use POSIX;
+
+# use the library for version control
+my $directory;
+BEGIN {$directory = dirname $0;} 
+use lib "${directory}/../lib";
+
+if (!-e "${directory}/../lib/version.pm") {
+   die "\nERROR: ${directory}/../lib/version.pm does not exist\n\n";
+}
+use version;
+
+# turn on auto flush
+$| = 1;
+
+my $full_name                   = $0;
+my $program_name                = basename $0;
+my $date                        = $version::date;
+my $version                     = $version::version;
+my $compare_location_sam_binary = "compare-location-sam.dna";
+my $sam_mapping_quality         = 255;
+my $mate_position_text          = "MATE_POSITION_TEXT";
+my $insert_length_text          = "INSERT_LENGTH_TEXT";
+my $flag_proper_pair            = "0x0002";
+my $samtools                    = "${directory}/samtools/install/bin/samtools";
+
+my $in_location_file;
+my $in_fastq1;
+my $in_fastq2;
+my $in_prefix;
+my $in_sam_file;
+my $in_tmp_dir;
+my $in_genome_1_or_2;
+my $in_ref_file;
+
+my $out_sam_file;
+my $out_merged_sorted_bam_file;
+my $out_location_log_file;
+my $out_samtools_log;
+my $help;
+
+my %hash_ref;
+
+my $header =
+"
+----------------------------------------------------------------------
+PROGRAM: $program_name
+CONTACT: Yun Heo (yunheo1\@illinois.edu)
+VERSION: $version
+DATE   : $date
+----------------------------------------------------------------------
+\n";
+
+my $usage =
+"USAGE: $program_name <ARGUMENTS>
+
+ARGUMENT            DESCRIPTION                  MANDATORY    DEFAULT
+----------------------------------------------------------------------
+-fastq1    <file>   forward fastq file           Y
+-fastq2    <file>   reverse fastq file           Y
+-genome  <1 or 2>   reverse fastq file           Y
+-h                  print help                   N
+-location  <file>   error location file          Y
+-prefix  <string>   output file prefix           Y
+-ref       <file>   reference fasta file         Y
+-sam       <file>   input sam file               Y
+-tmp        <dir>   tmp directory for sorting    N
+----------------------------------------------------------------------
+\n";
+
+
+
+######################################################################
+# main code
+######################################################################
+
+# print header
+&print_header;
+
+# parse arguments
+&parse_args;
+
+&find_not_correctly_aligned_reads;
+
+# compare reads
+&convert_location_to_sam;
+
+# merge sam files
+&merge_sam_files;
+
+print "\n####################### SUCCESSFULLY COMPLETED #######################\n\n";
+
+######################################################################
+# end of main code
+######################################################################
+
+
+
+#----------------------------------------------------------------------
+# print_header
+#----------------------------------------------------------------------
+sub print_header {
+   print $header;
+}
+
+
+
+#----------------------------------------------------------------------
+# parse_args
+#----------------------------------------------------------------------
+sub parse_args {
+   my $base_name;
+
+   if (@ARGV == 0) {
+      die $usage;
+   }
+
+   print "Parsing arguments\n";
+
+   if (!GetOptions (
+                    "h"           => \$help,
+                    "fastq1=s"    => \$in_fastq1,
+                    "fastq2=s"    => \$in_fastq2,
+                    "genome=i"    => \$in_genome_1_or_2,
+                    "location=s"  => \$in_location_file,
+                    "prefix=s"    => \$in_prefix,
+                    "ref=s"       => \$in_ref_file,
+                    "sam=s"       => \$in_sam_file,
+                    "tmp=s"       => \$in_tmp_dir,
+                   )
+       or $help) {
+      die $usage;
+   }
+
+   # error location file
+   if (!defined($in_location_file)) {
+      die "\nERROR: Input file name should be specified\n\n";
+   }
+   elsif (!-e $in_location_file) {
+      die "\nERROR: $in_location_file does not exist\n\n";
+   }
+
+   # fastq files
+   if (!defined($in_fastq1)) {
+      die "\nERROR: The forward fastq name should be specified\n\n";
+   }
+   elsif (!-e $in_fastq1) {
+      die "\nERROR: $in_fastq1 does not exist\n\n";
+   }
+
+   if (!defined($in_fastq2)) {
+      die "\nERROR: The reverse fastq name should be specified\n\n";
+   }
+   elsif (!-e $in_fastq2) {
+      die "\nERROR: $in_fastq2 does not exist\n\n";
+   }
+
+   # reference sequences
+   if (!defined($in_ref_file)) {
+      die "\nERROR: A referenge genome file name should be specified\n\n";
+   }   
+   elsif (!-e $in_ref_file) {
+      die "\nERROR: $in_ref_file does not exist\n\n";
+   }   
+
+   # sam file
+   if (!defined($in_sam_file)) {
+      die "\nERROR: An input sam file name should be specified\n\n";
+   }
+   elsif (!-e $in_sam_file) {
+      die "\nERROR: $in_sam_file does not exist\n\n";
+   }
+
+   # specify a genome
+   if (defined($in_genome_1_or_2)) {
+      if (($in_genome_1_or_2 != 1) && ($in_genome_1_or_2 != 2)) {
+         die "\nERROR: The genome option should be 1 or 2\n\n";
+      }   
+   }   
+   else {
+      die "\nERROR: The genome used (1 or 2) should be specified\n\n";
+   }   
+
+   # prefix
+   if (!defined($in_prefix)) {
+      die "\nERROR: The output file prefix should be specified\n\n";
+   }
+   else {
+      $out_sam_file               = $in_prefix . ".sam";
+      $out_merged_sorted_bam_file = $in_prefix . ".merged.sorted.bam";
+      $out_location_log_file      = $in_prefix . ".location.log";
+      $out_samtools_log           = $in_prefix . ".samtools.log";
+   }
+
+   print "     Parsing argumetns: done\n";
+}
+
+
+
+#----------------------------------------------------------------------
+# find_not_correctly_aligned_reads
+#----------------------------------------------------------------------
+sub find_not_correctly_aligned_reads {
+   print "\nFinding not correctly aligned reads\n";
+
+   $ENV{location_to_sam_dir}      = $directory;
+   $ENV{location_to_sam_comp_bin} = $compare_location_sam_binary;
+   $ENV{location_to_sam_loc}      = $in_location_file;
+   $ENV{location_to_sam_prefix}   = "${in_prefix}.compare";
+   $ENV{location_to_sam_sam}      = $in_sam_file;
+   $ENV{location_to_sam_log}      = $out_location_log_file;
+
+   my $cmd;
+
+   if (defined($in_tmp_dir)) {
+      $ENV{location_to_sam_tmp_dir} = $in_tmp_dir;
+
+      # genome 1
+      if ($in_genome_1_or_2 == 1) {
+         $cmd = q{perl ${location_to_sam_dir}/${location_to_sam_comp_bin} -genome 1 -location $location_to_sam_loc -prefix ${location_to_sam_prefix} -sam $location_to_sam_sam -strict -t $location_to_sam_tmp_dir > $location_to_sam_log};
+         system ($cmd);
+      }
+      # genome 2
+      elsif ($in_genome_1_or_2 == 2) {
+         $cmd = q{perl ${location_to_sam_dir}/${location_to_sam_comp_bin} -genome 2 -location $location_to_sam_loc -prefix ${location_to_sam_prefix} -sam $location_to_sam_sam -strict -t $location_to_sam_tmp_dir > $location_to_sam_log};
+         system ($cmd);
+      }
+      else {
+         die "\nERROR: Wrong genome option $in_genome_1_or_2\n\n";
+      }
+
+   }
+   else {
+      # genome 1
+      if ($in_genome_1_or_2 == 1) {
+         $cmd = q{perl ${location_to_sam_dir}/${location_to_sam_comp_bin} -genome 1 -location $location_to_sam_loc -prefix ${location_to_sam_prefix} -sam $location_to_sam_sam -strict > $location_to_sam_log};
+         system ($cmd);
+      }
+      # genome 2
+      elsif ($in_genome_1_or_2 == 2) {
+         $cmd = q{perl ${location_to_sam_dir}/${location_to_sam_comp_bin} -genome 2 -location $location_to_sam_loc -prefix ${location_to_sam_prefix} -sam $location_to_sam_sam -strict > $location_to_sam_log};
+         system ($cmd);
+      }
+      else {
+         die "\nERROR: Wrong genome option $in_genome_1_or_2\n\n";
+      }
+   }
+
+   print "     Finding not correctly aligned reads: done\n";
+}
+
+
+
+#----------------------------------------------------------------------
+# convert_location_to_sam
+#----------------------------------------------------------------------
+sub convert_location_to_sam {
+   print "\nGenerating a new sam file\n";
+
+   # open the alignment summary file
+   my $align_summary_file = ${in_prefix}. ".compare.align-summary";
+   open FH_ALIGN, "$align_summary_file"
+      or die "\nERROR: Cannot open $align_summary_file\n\n";
+
+   # open the input location file
+   open FH_LOCATION, "$in_location_file"
+      or die "\nERROR: Cannot open $in_location_file\n\n";
+
+   # open the input read file
+   open FH_FASTQ1, "$in_fastq1"
+      or die "\nERROR: Cannot open $in_fastq1\n\n";
+   open FH_FASTQ2, "$in_fastq2"
+      or die "\nERROR: Cannot open $in_fastq2\n\n";
+
+   # open the output sam file
+   open FH_SAM, ">$out_sam_file"
+      or die "\nERROR: Cannot open $out_sam_file\n\n";
+
+   # each alignment line
+   while (my $line_alignment = <FH_ALIGN>) {
+      if ($line_alignment =~ /^(\S+)\s+(\S+)\s+(\S+)/) {
+         my $read_name1_align = $1;
+         my $read_name2_align = $2;
+         my $status           = $3;
+
+         # write a sam line
+         if (($status eq "MISMATCHED") || ($status eq "UNALIGNED")) {
+            my $line_sam1;
+            my $line_sam2;
+
+            my $line_location1;
+            my $line_location2;
+
+            my $line_read_name1;
+            my $line_read_name2;
+
+            my $line_sequence1;
+            my $line_sequence2;
+
+            my $line_qs1;
+            my $line_qs2;
+
+            my $line_tmp;
+
+            # read location lines
+            $line_location1 = <FH_LOCATION>;
+            $line_location2 = <FH_LOCATION>;
+
+            # no location information
+            # skip corresponding reads
+            if (($line_location1 =~ /^\S+\s+N\/A\s*$/) &&
+                ($line_location2 =~ /^\S+\s+N\/A\s*$/)) {
+               $line_tmp = <FH_FASTQ1>;
+               $line_tmp = <FH_FASTQ1>;
+               $line_tmp = <FH_FASTQ1>;
+               $line_tmp = <FH_FASTQ1>;
+
+               # check the number of reads
+               if (!defined($line_tmp)) {
+                  die "\nERROR: The number of reads in $in_fastq1 is different from that in $in_location_file\n\n";
+               }
+
+               $line_tmp = <FH_FASTQ2>;
+               $line_tmp = <FH_FASTQ2>;
+               $line_tmp = <FH_FASTQ2>;
+               $line_tmp = <FH_FASTQ2>;
+
+               # check the number of reads
+               if (!defined($line_tmp)) {
+                  die "\nERROR: The number of reads in $in_fastq2 is different from that in $in_location_file\n\n";
+               }
+            }
+            # location information exists
+            else {
+               # read read lines
+               $line_read_name1 = <FH_FASTQ1>;
+               $line_sequence1  = <FH_FASTQ1>;
+               $line_tmp        = <FH_FASTQ1>;
+               $line_qs1        = <FH_FASTQ1>;
+
+               # check the number of reads
+               if (!defined($line_qs1)) {
+                  die "\nERROR: The number of reads in $in_fastq1 is different from that in $in_location_file\n\n";
+               }
+
+               $line_read_name2 = <FH_FASTQ2>;
+               $line_sequence2  = <FH_FASTQ2>;
+               $line_tmp        = <FH_FASTQ2>;
+               $line_qs2        = <FH_FASTQ2>;
+
+               # check the number of reads
+               if (!defined($line_qs2)) {
+                  die "\nERROR: The number of reads in $in_fastq2 is different from that in $in_location_file\n\n";
+               }
+
+               #--------------------------------------------------
+               # convert a location line to a sam line
+               #--------------------------------------------------
+               chomp $line_location1;
+               chomp $line_location2;
+               chomp $line_sequence1;
+               chomp $line_sequence2;
+               chomp $line_qs1;
+               chomp $line_qs2;
+
+               $line_sam1 = &location_to_sam_read($line_location1, $line_sequence1, $line_qs1, 1);
+               $line_sam2 = &location_to_sam_read($line_location2, $line_sequence2, $line_qs2, 2);
+
+               #--------------------------------------------------
+               # post-process paired positions and insert length
+               #--------------------------------------------------
+               my $read_name1;
+               my $read_name2;
+               my $position1;
+               my $position2;
+               my $sequence1;
+               my $sequence2;
+               my $insert_length1;
+               my $insert_length2;
+
+               # 1st
+               if ($line_sam1 =~ /^(\S+)\s+\S+\s+\S+\s+(\d+)\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+(\S+)/) {
+                  $read_name1 = $1;
+                  $position1  = $2;
+                  $sequence1  = $3;
+               }
+               else {
+                  die "\nERROR: Illegal sam line $line_sam1\n\n";
+               }
+
+               # 2nd
+               if ($line_sam2 =~ /^(\S+)\s+\S+\s+\S+\s+(\d+)\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+(\S+)/) {
+                  $read_name2 = $1;
+                  $position2  = $2;
+                  $sequence2  = $3;
+               }
+               else {
+                  die "\nERROR: Illegal sam line $line_sam2\n\n";
+               }
+
+               # compare positions
+               # 1st: ----------
+               # 2nd                ----------
+               #      |             |        |
+               if ($position1 <= $position2) {
+                  $insert_length1 = $position2 - $position1 + length($sequence2);
+                  $insert_length2 = -$insert_length1;
+               }
+               # 1st:               ----------
+               # 2nd  ----------
+               #      |             |        |
+               elsif ($position1 > $position2) {
+                  $insert_length1 = -($position1 - $position2 + length($sequence1));
+                  $insert_length2 = -$insert_length1;
+               }
+               else {
+                  die "\nERROR: Illegal aligned positions $position1 $position2 in $read_name1 and $read_name2\n\n";
+               }
+
+               $line_sam1 =~ s/$mate_position_text/$position2/;
+               $line_sam1 =~ s/$insert_length_text/$insert_length1/;
+
+               $line_sam2 =~ s/$mate_position_text/$position1/;
+               $line_sam2 =~ s/$insert_length_text/$insert_length2/;
+
+               #--------------------------------------------------
+               # write sam lines
+               #--------------------------------------------------
+               print FH_SAM $line_sam1;
+               print FH_SAM $line_sam2;
+            }
+         }
+         # skip this pair
+         else {
+            my $line_tmp;
+
+            # location file
+            $line_tmp = <FH_LOCATION>;
+            $line_tmp = <FH_LOCATION>;
+
+            # read files
+            $line_tmp = <FH_FASTQ1>;
+            $line_tmp = <FH_FASTQ1>;
+            $line_tmp = <FH_FASTQ1>;
+            $line_tmp = <FH_FASTQ1>;
+
+            # check the number of reads
+            if (!defined($line_tmp)) {
+               die "\nERROR: The number of reads in $in_fastq1 is different from that in $in_location_file\n\n";
+            }
+
+            $line_tmp = <FH_FASTQ2>;
+            $line_tmp = <FH_FASTQ2>;
+            $line_tmp = <FH_FASTQ2>;
+            $line_tmp = <FH_FASTQ2>;
+
+            # check the number of reads
+            if (!defined($line_tmp)) {
+               die "\nERROR: The number of reads in $in_fastq2 is different from that in $in_location_file\n\n";
+            }
+         }
+      }
+      else {
+         die "\nERROR: Irregular alignement line $line_alignment\n\n";
+      }
+   }
+
+   close FH_ALIGN;
+   close FH_LOCATION;
+   close FH_FASTQ1;
+   close FH_FASTQ2;
+   close FH_SAM;
+
+# DEBUG
+#   unlink $align_summary_file;
+
+   print "     Generating a new sam file: done\n\n";
+}
+
+
+
+#----------------------------------------------------------------------
+# merge_sam_files
+#----------------------------------------------------------------------
+sub merge_sam_files {
+   print "Generating a merged bam file\n";
+
+   $ENV{location_to_sam_in_sam}        = $in_sam_file;
+   $ENV{location_to_sam_generated_sam} = $out_sam_file;
+   $ENV{location_to_sam_samtools}      = $samtools;
+   $ENV{location_to_sam_ref_fa}        = $in_ref_file;
+   $ENV{location_to_sam_out_prefix}    = $in_prefix;
+   $ENV{location_to_sam_out_bam}       = "${in_prefix}.bam";
+   $ENV{location_to_sam_samtools_log}  = $out_samtools_log;
+   $ENV{location_to_sam_flag}          = $flag_proper_pair;
+
+   my $cmd;
+
+   # generate a merged/sorted bam file
+   $cmd = q{$location_to_sam_samtools view -f $location_to_sam_flag -Sh $location_to_sam_in_sam | cat - $location_to_sam_generated_sam | $location_to_sam_samtools calmd -bS - $location_to_sam_ref_fa | $location_to_sam_samtools sort - $location_to_sam_out_prefix};
+   system ($cmd);
+
+   # generate the index file for the bam
+   $cmd = q{$location_to_sam_samtools index $location_to_sam_out_bam};
+   system ($cmd);
+
+# DEBUG
+#   unlink $out_sam_file;
+
+   print "     Generating a merged bam file: done\n";
+}
+
+
+
+#----------------------------------------------------------------------
+# location_to_sam_read
+#----------------------------------------------------------------------
+sub location_to_sam_read {
+   # check the number of arguments
+   my $num_arguments = 4;
+   my $function_name = "location_to_sam";
+   if (@_ != $num_arguments) {
+      die "\nERROR: The number of argumetns of $function_name should be $num_arguments\n\n";
+   }
+
+   my ($line_location, $line_read, $line_qs, $read_order) = @_;
+
+   my $out_sam_line;
+
+   # <read name> <ref 1 or 2> <ref name> <strand> <start index> <read length> <substitutions> <insertions> <deletions>
+   if ($line_location =~ /^(\S+)\s+([12])\s+(\S+)\s+([\+\-])\s+([\d\-]+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(\S+)/) {
+      my $read_name_location   = $1;
+      my $ref_1_or_2           = $2;
+      my $seq_name             = $3;
+      my $strand               = $4;
+      my $position_location    = $5; # start from 1
+      my $read_length_location = $6;
+      my $substitution         = $7;
+      my $insertion            = $8;
+      my $deletion             = $9;
+
+      #--------------------------------------------------
+      # generate a hash table for substitutions
+      # 1-based
+      # ref  AAA
+      # read AAC
+      # 3:A->C;
+      #--------------------------------------------------
+      my $num_substitutions = 0;
+
+      unless ($substitution eq "-") {
+         while ($substitution =~ /(\d+):([ACGT])\->([ACGT]);/g) {
+            $num_substitutions++;
+         }
+      }
+
+      #--------------------------------------------------
+      # generate an array for insertions
+      #--------------------------------------------------
+      my @array_insertion_index;
+      my @array_insertion_length;
+
+      my $num_insertions_index = 0;
+      my $num_insertions = 0;
+
+      unless ($insertion eq "-") {
+         while ($insertion =~ /(\d+):([ACGT]+);/g) {
+            $array_insertion_index[$num_insertions_index] = $1;
+            $array_insertion_length[$num_insertions_index] = length($2);
+
+            $num_insertions_index++;
+            $num_insertions = $num_insertions + length $2;
+         }
+      }
+
+      #--------------------------------------------------
+      # generate an array for deletions
+      #--------------------------------------------------
+      my @array_deletion_index;
+
+      my $num_deletions = 0;
+
+      unless ($deletion eq "-") {
+         while ($deletion =~ /(\d+):[ACGT];/g) {
+            $array_deletion_index[$num_deletions] = $1;
+
+            $num_deletions++;
+         }
+      }
+
+      #--------------------------------------------------
+      # set the flag
+      #--------------------------------------------------
+      # first read of a pair
+      # $flag = 67
+      my $flag;
+      if ($read_order == 1) {
+         # $flag += 16
+         if ($strand eq "+") {
+            $flag = 83;
+         }
+         # $flag += 32
+         else {
+            $flag = 99;
+         }
+      }
+      # second read of a pair
+      # flag = 131
+      elsif ($read_order == 2) {
+         # $flag += 16
+         if ($strand eq "+") {
+            $flag = 147;
+         }
+         # $flag += 32
+         else {
+            $flag = 163;
+         }
+      }
+      else {
+         die "\nERROR: Wrong read order $read_order $read_name_location\n\n";
+      }
+
+      #--------------------------------------------------
+      # generate a temporary string that includes both insertions and deletions
+      # cigar
+      # md values will be recalculated later using samtools
+      #
+      # 1. "+" strand
+      # 1) match
+      # REF : TGCCCTGGCTGCTCCGCATTGCAGGAGCTGCGCCCTTCCTTTCCTGGCACAGGGTCCACAGCCCCGAAAC
+      # READ: TGCCCTGGCTGCTCCGCATTGCAGGAGCTGCGCCCTTCCTTTCCTGGCAC
+      # CIGAR: 50M
+      # MD:Z:50
+      # 
+      # 2) mismatch
+      # REF : TGCCCTGGCTGCTCCGCATTGCAGGAGCTGCGCCCTTCCTTTCCTGGCACAGGGTCCACAGCCCCGAAAC
+      # READ: TGCCCTAGCTGCTCCGCATTGCAGGAGCTGCGCCCTTCCTTTCCTGGCACAGGGTC
+      #            6|43
+      # CIGAR: 50M
+      # MD:Z:6G43
+      # 
+      # 3) insertion
+      # REF : TGCCCTGGCTGCTCCGCATTGCAG--GAGCTGCGCCCTTCCTTTCCTGGCACAGGGTCCACAGCCCCGAAAC
+      # READ: TGCCCTGGCTGCTCCGCATTGCAGTAGAGCTGCGCCCTTCCTTTCCTGGCA
+      #                               ||
+      # CIGAR: 24M2I25M
+      # MD:Z:49 <read length> - <# of insertions>
+      # 
+      # 4) deletion
+      # REF : TGCCCTGGCTGCTCCGCATTGCAGGAGCTGCGCCCTTCCTTTCCTGGCACAGGGTCCACAGCCCCGAAAC
+      # READ: TGCCCTGGCTGCTCCGCATTGCAGGAGCT--GCCCTTCCTTTCCTGGCACA
+      #                                  29||20
+      # CIGAR: 29M2D20M
+      # MD:Z:29^GC20
+      # 
+      # 5) I-MM-D
+      # REF : TGCCCT-GGCTGCTCCGCATTGCAGGAGCTGCGCCCTTCCTTTCCTGGCACAGGGTCCACAGCCCCGAAAC
+      # READ: TGCCCTAGGCTGCTCCGCATTGCAGGCGCTGCGCCCTTCCTTTCC-GGCAC
+      #            6|38                 |                  |5
+      # CIGAR: 6M1I38M1D5M
+      # MD:Z:25A18^T5
+      # 
+      # 2. "-" strand
+      # Reverse complement of the read should be written in the 10th column of a sam line
+      # 1) match
+      # REF : GTTTCGGGGCTGTGGACCCTGTGCCAGGAAAGGAAGGGCGCAGCTCCTGCAATGCGGAGCAGCCAGGGCA
+      # READ:                     GTGCCAGGAAAGGAAGGGCGCAGCTCCTGCAATGCGGAGCAGCCAGGGCA
+      # CIGAR: 50M
+      # MD:Z:50
+      # 
+      # 2) mismatch
+      # REF : GTTTCGGGGCTGTGGACCCTGTGCCAGGAAAGGAAGGGCGCAGCTCCTGCAATGCGGAGCAGCCAGGGCA
+      # READ:                     GTGCCAGGAAAGTAAGGGCGCAGCTCCTGCAATGCGGAGCAGCCAGGGCA
+      #                                     12|37                                   
+      # CIGAR: 50M
+      # MD:Z:37C12
+      # 
+      # 3) insertion
+      # REF : GTTTCGGGGCTGTGGACCCTGTGCCAGGAAAGGAAGGGC--GCAGCTCCTGCAATGCGGAGCAGCCAGGGCA
+      # READ:                     GTGCCAGGAAAGGAAGGGCAAGCAGCTCCTGCAATGCGGAGCAGCCAGGGCA
+      #                                            19| 31
+      # CIGAR: 31M2I19M
+      # MD:Z:50 <read length> - <# of insertions>
+      # 
+      # 4) deletion
+      # REF : GTTTCGGGGCTGTGGACCCTGTGCCAGGAAAGGAAGGGCGCAGCTCCTGCAATGCGGAGCAGCCAGGGCA
+      # READ:                     GTGCCAGGAAAGGAAGGGCGCAGC--CTGCAATGCGGAGCAGCCAGGGCA
+      #                                                 24 |24                       
+      # CIGAR: 24M2D24M
+      # MD:Z:24^GA24
+      #--------------------------------------------------
+      # $mid_string: string that consists of "M"s, "I"s and "D"s
+      my $mid_string = "M" x ($read_length_location + $num_deletions - $num_insertions);
+      my $mid_string_prefix;
+      my $mid_string_postfix;
+
+      # change deleted bases to "D"s
+      for (my $i = 0; $i < $num_deletions; $i++) {
+         # deletion in the 1st base
+         # indices in the array are 1-based
+         if ($array_deletion_index[$i] == 1) {
+            $mid_string_prefix  = "";
+            $mid_string_postfix = substr($mid_string, 1,);
+         }
+         # $array_deletion_index[$i] = 3
+         # ORG: MMMMM
+         # MOD: MMDMM
+         # prefix length: $array_deletion_index[$i] - 1 = 2
+         else {
+            $mid_string_prefix  = substr($mid_string, 0, $array_deletion_index[$i] - 1);
+            $mid_string_postfix = substr($mid_string, $array_deletion_index[$i],);
+         }
+
+         $mid_string = $mid_string_prefix . "D" . $mid_string_postfix;
+      }
+
+      # insert "I"s to the insertion points
+      # use the reverse order
+      if ($num_insertions_index > 0) {
+         for (my $i = ($num_insertions_index - 1); $i >= 0; $i--) {
+            # insertions to the left of $mid_string
+            if ($array_insertion_index[$i] == 0) {
+               $mid_string_prefix  = "";
+               $mid_string_postfix = $mid_string;
+            }
+            # $array_insertion_index[$i]  = 3
+            # $array_insertion_length[$i] = 2
+            # ORG: MMMMM
+            # MOD: MMMIIMM
+            # prefix length: $array_insertion_index[$i] = 3
+            # postfix start index: 
+            else {
+               $mid_string_prefix  = substr($mid_string, 0, $array_insertion_index[$i]);
+               $mid_string_postfix = substr($mid_string, $array_insertion_index[$i],);
+            }
+
+            my $string_is = "I" x $array_insertion_length[$i];
+
+            $mid_string = $mid_string_prefix . $string_is . $mid_string_postfix;
+         }
+      }
+
+      #--------------------------------------------------
+      # convert $mid_string to a CIGAR string
+      #--------------------------------------------------
+      my $cigar = "";
+      my $cigar_postfix;
+      my $previous_char = "";
+      my $current_status;
+      my $current_length;
+      my $first_character = 1;
+
+      for (my $i = 0; $i < length($mid_string); $i++) {
+         my $current_char = substr($mid_string, $i, 1);
+
+         # consecutive M/I/Ds
+         if ($current_char eq $previous_char) {
+            $current_length++;
+         }
+         # start a new one
+         else {
+            # first character of $mid_string
+            # do nothing
+            if ($first_character == 1) {
+               $first_character = 0;
+            }
+            # not first character of $mid_string
+            # add the previous characters to $cigar
+            else {
+               $cigar_postfix = "${current_length}${previous_char}";
+               $cigar         = $cigar . $cigar_postfix;
+            }
+
+            $previous_char = $current_char;
+            $current_length = 1;
+         }
+      }
+
+      # last ones are not added to $cigar yet
+      $cigar_postfix = "${current_length}${previous_char}";
+      $cigar         = $cigar . $cigar_postfix;
+
+      # reverse the cigar string if the strand is "-"
+      if ($strand eq "-") {
+         my $cigar_tmp = "";
+
+         while ($cigar =~ /(\d+[A-Z])/g) {
+            $cigar_tmp = $1 . $cigar_tmp;
+         }
+
+         $cigar = $cigar_tmp;
+      }
+
+      #--------------------------------------------------
+      # nm <number of substitutions/insertions/deletions>
+      #--------------------------------------------------
+      my $nm = $num_substitutions + $num_insertions + $num_deletions;
+
+      #--------------------------------------------------
+      # read a sequence from the fastq
+      #--------------------------------------------------
+      if ($read_order == 1) {
+         $read_name_location =~ s/\/1$//;
+      }
+      elsif ($read_order == 2) {
+         $read_name_location =~ s/\/2$//;
+      }
+      else {
+         die "\nERROR: Wrong read order $read_order $read_name_location\n\n";
+      }
+
+      # sequence
+      #chomp $line_read;
+      #chomp $line_qs;
+
+      if ($strand eq "-") {
+         # reverse complement
+         $line_read = reverse $line_read;
+         $line_read =~ s/A/A_/g;
+         $line_read =~ s/C/C_/g;
+         $line_read =~ s/G/G_/g;
+         $line_read =~ s/T/T_/g;
+         $line_read =~ s/A_/T-/g;
+         $line_read =~ s/C_/G-/g;
+         $line_read =~ s/G_/C-/g;
+         $line_read =~ s/T_/A-/g;
+         $line_read =~ s/-//g;
+
+         # reverse
+         $line_qs = reverse $line_qs;
+      }
+
+      #--------------------------------------------------
+      # print the sam line to the output file
+      #--------------------------------------------------
+      $out_sam_line = "$read_name_location\t$flag\t$seq_name\t$position_location\t$sam_mapping_quality\t$cigar\t=\t$mate_position_text\t$insert_length_text\t$line_read\t$line_qs\n";
+   }
+   else {
+      die "\nERROR: $line_location\n\n";
+   }
+
+   return $out_sam_line;
+}

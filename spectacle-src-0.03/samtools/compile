@@ -1,0 +1,8 @@
+#!/bin/bash
+
+install_dir=${PWD}/install
+
+cd samtools-1.2
+
+make
+make prefix=${install_dir} install

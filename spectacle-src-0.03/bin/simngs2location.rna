@@ -1,0 +1,687 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use File::Basename;
+use Getopt::Long;
+use POSIX;
+
+# these modules should be installed
+eval {
+   use Parallel::MPI::Simple;
+};
+if ($@) {
+   die "\nERROR: Module Parallel::MPI::Simple is not installed\n\n";
+}
+
+# turn on auto flush
+$| = 1;
+
+# use the custom nw algorithm library
+my $directory;
+BEGIN {$directory = dirname $0;}
+use lib "${directory}/../lib";
+
+if (!-e "${directory}/../lib/evaluate.pm") {
+   die "\nERROR: ${directory}/../lib/evaluate.pm does not exist\n\n";
+}
+use evaluate;
+
+# use the library for version control
+if (!-e "${directory}/../lib/version.pm") {
+   die "\nERROR: ${directory}/../lib/version.pm does not exist\n\n";
+}
+use version;
+
+my $full_name                     = $0;
+my $program_name                  = basename $0;
+my $date                          = $version::date;
+my $version                       = $version::version;
+my $num_substitutions             = 0;
+my $num_insertions                = 0;
+my $num_deletions                 = 0;
+my $max_seq_length                = 1000;
+my $alphabets                     = "ACGT";
+my $match_gain_default            = 1;
+my $mismatch_penalty_default      = -4;
+my $gap_extension_penalty_default = -1;
+my $gap_opening_penalty_default   = -6;
+
+my $strand;
+my $read_length;
+
+my $header =
+"
+----------------------------------------------------------------------
+PROGRAM: $program_name
+CONTACT: Yun Heo (yunheo1\@illinois.edu)
+VERSION: $version
+DATE   : $date
+----------------------------------------------------------------------
+\n";
+
+my $usage =
+"USAGE: $program_name <ARGUMENTS>
+
+ARGUMENT              DESCRIPTION                   MANDATORY  DEFAULT
+----------------------------------------------------------------------
+-errfastq     <file> input fastq file from simngs   Y
+-errfreefasta <file> input fasta file from beers    Y
+-gext       <number>  gap extension penalty         N               $gap_extension_penalty_default
+-gopen      <number>  gap opening penalty           N               $gap_opening_penalty_default
+-h                   print help                     N
+-match      <number>  match gain                    N                $match_gain_default
+-mmatch     <number>  mismatch penalty              N               $mismatch_penalty_default
+-prefix     <string> output file prefix             Y
+----------------------------------------------------------------------
+\n";
+
+
+
+######################################################################
+# main code
+######################################################################
+
+MPI_Init();
+
+#
+# variables
+#
+my $num_substitutions_local = 0;
+my $num_insertions_local = 0;
+my $num_deletions_local = 0;
+
+my $in_beers_fasta_file;
+my $in_simngs_fastq_file;
+my $in_match_gain;
+my $in_mismatch_penalty;
+my $in_gap_opening_penalty;
+my $in_gap_extension_penalty;
+
+my $prefix;
+
+my $out_error_location_file;
+my $out_error_location_file_local;
+
+my $help;
+my $matrix;
+my $fh_error_location;
+
+# 1-based
+my @score_matrix;
+
+# mpi variables
+my $rank      = MPI_Comm_rank(MPI_COMM_WORLD);
+my $num_procs = MPI_Comm_size(MPI_COMM_WORLD);
+my $rank_text = sprintf "%0*d", 3, $rank;
+
+#
+# print header
+#
+if ($rank == 0) {
+   &print_header;
+}
+
+#
+# parse arguments
+#
+&parse_args;
+
+# compare reads
+&compare_reads;
+
+MPI_Finalize();
+
+# merge output files
+&merge_output_files;
+
+if ($rank == 0) {
+   print "\n####################### SUCCESSFULLY COMPLETED #######################\n\n";
+}
+
+######################################################################
+# end of main code
+######################################################################
+
+
+#----------------------------------------------------------------------
+# print_header
+#----------------------------------------------------------------------
+sub print_header {
+   print $header;
+}
+
+
+#----------------------------------------------------------------------
+# parse_args
+#----------------------------------------------------------------------
+sub parse_args {
+   if (@ARGV == 0) {
+      die $usage;
+   }
+
+   if ($rank == 0) {
+      print "Parsing arguments\n";
+      print "     Code: $full_name\n";
+   }
+
+   if (!GetOptions (
+                    "errfastq=s"     => \$in_simngs_fastq_file,
+                    "errfreefasta=s" => \$in_beers_fasta_file,
+                    "gext=i"         => \$in_gap_extension_penalty,
+                    "gopen=o"        => \$in_gap_opening_penalty,
+                    "h"              => \$help,
+                    "match=i"        => \$in_match_gain,
+                    "mmatch=i"       => \$in_mismatch_penalty,
+                    "prefix=s"       => \$prefix,
+                   )
+       or $help) {
+      die $usage;
+   }
+
+   # beers fasta file
+   if (defined($in_beers_fasta_file)) {
+      if (!-e "$in_beers_fasta_file") {
+         die "\nERROR: $in_beers_fasta_file does not exist\n\n";
+      }
+   }
+   else {
+      die "\nERROR: $in_beers_fasta_file is not defined\n\n";
+   }
+
+   # simngs fastq file
+   if (defined($in_simngs_fastq_file)) {
+      # check whether fastq exists
+      if (!-e "$in_simngs_fastq_file") {
+         die "\nERROR: $in_simngs_fastq_file does not exist\n\n";
+      }
+   }
+   else {
+      die "\nERROR: $in_simngs_fastq_file is not defined\n\n";
+   }
+
+   # output prefix
+   if (!defined($prefix)) {
+      die "\nERROR: The output prefix is not defined\n\n";
+   }
+
+   # match gain
+   if (defined($in_match_gain)) {
+      if ($in_match_gain < 0) {
+         die "\nERROR: Match gain should be >= 0\n\n";
+      }
+   }
+   else {
+      $in_match_gain = $match_gain_default;
+   }
+
+   # mismatch penalty
+   if (defined($in_mismatch_penalty)) {
+      if ($in_mismatch_penalty > 0) {
+         die "\nERROR: Mismatch penalty should be <= 0\n\n";
+      }
+   }
+   else {
+      $in_mismatch_penalty = $mismatch_penalty_default;
+   }
+
+   # gap extension penalty
+   if (defined($in_gap_extension_penalty)) {
+      if ($in_gap_extension_penalty > 0) {
+         die "\nERROR: Gap extension penalty should be <= 0\n\n";
+      }
+   }
+   else {
+      $in_gap_extension_penalty = $gap_extension_penalty_default;
+   }
+
+   # gap opening penalty
+   if (defined($in_gap_opening_penalty)) {
+      if ($in_gap_opening_penalty > 0) {
+         die "\nERROR: Gap open penalty should be <= 0\n\n";
+      }
+   }
+   else {
+      $in_gap_opening_penalty = $gap_opening_penalty_default;
+   }
+
+   # output files
+   $out_error_location_file       = $prefix . ".location";
+   $out_error_location_file_local = $prefix . ".location". "." . $rank_text;
+
+   if ($rank == 0) {
+      print "     Number of processors: $num_procs\n";
+      print "     Parsing argumetns: done\n";
+   }
+}
+
+
+#----------------------------------------------------------------------
+# compare_reads
+#----------------------------------------------------------------------
+sub compare_reads {
+   if ($rank == 0) {
+      print "\nComparing reads\n";
+   }
+
+   my $fh_beers_fasta;
+   my $fh_simngs_fastq;
+
+   # open the beers fasta files
+   open $fh_beers_fasta, "$in_beers_fasta_file"
+      or die "\nERROR: Cannot open $in_beers_fasta_file\n\n";
+
+   # open the simngs fastq file
+   open $fh_simngs_fastq, "$in_simngs_fastq_file"
+      or die "\nERROR: Cannot open $in_simngs_fastq_file\n\n";
+
+   # open the error location file
+   open $fh_error_location, ">$out_error_location_file_local"
+      or die "\nERROR: Cannot open $out_error_location_file_local\n\n";
+
+   # read each file
+   my $num_reads = 0;
+   my $line_tmp;
+
+   while (my $line_beers = <$fh_beers_fasta>) {
+      if (($num_reads % $num_procs) == $rank) {
+         #--------------------------------------------------
+         # beers
+         #--------------------------------------------------
+         # header
+         my $read_id_beers;
+         if ($line_beers =~ /^>(\S+)/) {
+            $read_id_beers = $1;
+         }
+         else {
+            die "\nERROR(beers): $line_beers\n";
+         }
+
+         # sequence
+         my $sequence_beers = <$fh_beers_fasta>;
+         unless (defined($sequence_beers)) {
+            die "\nERROR: The number of lines of $in_beers_fasta_file is wrong\n";
+         }
+         chomp $sequence_beers;
+
+         #--------------------------------------------------
+         # simngs
+         #--------------------------------------------------
+         # header
+         my $read_id_simngs;
+         my $line_simngs = <$fh_simngs_fastq>;
+         if ($line_simngs =~ /^\@(\S+)/) {
+            $read_id_simngs = $1;
+         }
+         else {
+            die "\nERROR(simngs): $line_simngs\n";
+         }
+
+         # sequence
+         my $sequence_simngs = <$fh_simngs_fastq>;
+         chomp $sequence_simngs;
+
+         # remainings
+         $line_simngs = <$fh_simngs_fastq>;
+         $line_simngs = <$fh_simngs_fastq>;
+         unless (defined($line_simngs)) {
+            die "\nERROR: The number of lines of $in_simngs_fastq_file is wrong\n";
+         }
+
+         #--------------------------------------------------
+         # compare reads
+         #--------------------------------------------------
+         # compare sequence length
+         if (length($sequence_beers) != length($sequence_simngs)) {
+            die "\nERROR: $sequence_beers vs $sequence_simngs\n\n";
+         }
+
+         $read_length = length($sequence_simngs);
+
+         if (($num_reads % 2) == 0) {
+            $strand = "+";
+         }
+         else {
+            $strand = "-";
+         }
+
+         # Ns in reads
+         if (($sequence_beers =~ /N/i) || ($sequence_simngs =~ /N/i)) {
+             print $fh_error_location "$read_id_beers N/A\n";
+         }
+         # no error is added by simngs
+         elsif ($sequence_beers eq $sequence_simngs) {
+            # <read name> <ref 1 or 2> <ref name> <strand> <start index> <read length> <substitutions> <insertions> <deletions>
+            # ref 1 or 2 : always 1
+            # ref name   : "-"
+            # start index: 0
+            print $fh_error_location "$read_id_beers 1 - $strand 0 $read_length - - -\n"
+         }
+         # errors are added by simngs
+         else {
+            &compare_one_read($sequence_beers, $sequence_simngs, $read_id_beers);
+         }
+      }
+      # skip this read
+      else {
+         $line_tmp = <$fh_beers_fasta>;
+
+         $line_tmp = <$fh_simngs_fastq>;
+         $line_tmp = <$fh_simngs_fastq>;
+         $line_tmp = <$fh_simngs_fastq>;
+         $line_tmp = <$fh_simngs_fastq>;
+      }
+
+      $num_reads++;
+   }
+
+   # check if the read files still have lines
+   $line_tmp = <$fh_beers_fasta>;
+   if (defined($line_tmp)) {
+      die "\nERROR: Number of lines in the info file is not matched with that in the original read\n\n";
+   }
+
+   # close files
+   close $fh_beers_fasta;
+   close $fh_simngs_fastq;
+   close $fh_error_location;
+
+   # wait until all the processors finish calculating local sums
+   MPI_Barrier(MPI_COMM_WORLD);
+
+   # calculate total sums
+   $num_substitutions = MPI_Reduce($num_substitutions_local, sub {$_[0] + $_[1]}, MPI_COMM_WORLD);
+   $num_insertions    = MPI_Reduce($num_insertions_local, sub {$_[0] + $_[1]}, MPI_COMM_WORLD);
+   $num_deletions     = MPI_Reduce($num_deletions_local, sub {$_[0] + $_[1]}, MPI_COMM_WORLD);
+
+   # print final statistics
+   if ($rank == 0) {
+      print  "     Number of errors in the simngs fastq file:\n";
+      printf "          Substitutions     : %12d\n", $num_substitutions;
+      printf "          Insertions        : %12d\n", $num_insertions;
+      printf "          Deletions         : %12d\n", $num_deletions;
+      print  "     Comparing reads: done\n";
+      print  "\n";
+   }
+}
+
+
+#----------------------------------------------------------------------
+# compare_one_read
+#----------------------------------------------------------------------
+sub compare_one_read {
+   # check the number of arguments
+   my $num_arguments = 3;
+   my $function_name = "compare_one_read";
+   if (@_ != $num_arguments) {
+      die "\nERROR: The number of argumetns of $function_name should be $num_arguments\n\n";
+   }
+   # 1st argument: sequence of the beers file
+   # 2nd argument: sequence of the simngs file
+   # 3rd argument: read id
+
+   # parse arguments
+   my ($sequence_beers, $sequence_simngs, $read_id) = @_;
+
+   # check input sequences
+   $sequence_beers  = &check_sequence($sequence_beers);
+   $sequence_simngs = &check_sequence($sequence_simngs);
+
+   # pass the variables from the perl variables to the c++ variables
+   $evaluate::gap_extension_penalty = $in_gap_extension_penalty;
+   $evaluate::gap_opening_penalty   = $in_gap_opening_penalty;
+   $evaluate::match_gain            = $in_match_gain;
+   $evaluate::max_candidates        = 0;
+   $evaluate::mismatch_penalty      = $in_mismatch_penalty;
+   $evaluate::outer_3_end           = "";
+   $evaluate::outer_5_end           = "";
+   $evaluate::read_length           = length($sequence_beers);
+   $evaluate::string1               = $sequence_beers;
+   $evaluate::string2               = $sequence_simngs;
+   $evaluate::no_end_gap_penalty    = 0;
+
+   # initialize c variables
+   evaluate::initialize_variables();
+
+   # fill the alignment matrixes using dynamic programming
+   evaluate::fill_matrixes();
+
+   # print the matrixes for the debugging purpose
+   #evaluate::print_matrixes();
+
+   # take the 1st alignment
+   evaluate::give_random_alignment();
+
+   my $align1 = $evaluate::random_alignment1;
+   my $align2 = $evaluate::random_alignment2;
+
+   if ((length($align1) > 0) && (length($align2) > 0)) {
+      my %hash_substitution_org;
+      my %hash_substitution_err;
+      my %hash_insertion;
+      my %hash_deletion;
+
+      # count insertions to the left of a read
+      # and the insertions are deleted from the sequences
+      # these insertions should be added to $hash_insertion{0}
+      # $-, $+ notation # example
+      #         012345
+      # beers : ---ACG
+      # simngs: AAAACG
+      # $-[0]:0 $+[0]:3
+      my $align_length = length($align1);
+
+#      if ($align1 =~ /^(\-+)/) {
+#         $hash_insertion{0} = substr($align2, 0, $+[0] - $-[0]);
+#
+#         $align1 = substr($align1, +[0]);
+#         $align2 = substr($align2, +[0]);
+#      }
+
+      # find insertions
+      # $-, $+ notation # example
+      #         0123456789
+      # beers : ACG---T
+      # simngs: ACGCCCT
+      # 1st $-[0]:3 $+[0]:6
+
+      # index: 1-based, beers-read-based
+      # an insertion is made to the right of the index
+      my $index_adjust = 0;
+      while ($align1 =~ /[\-]+/g) {
+         my $length = $+[0] - $-[0];
+         my $index  = $-[0] - $index_adjust;
+
+         $hash_insertion{$index} = substr($align2, $-[0], $length);
+
+         $index_adjust += $length;
+         $num_insertions_local += $length;
+      }
+
+      # generate alignment results without insretions
+      my $align1_no_i;
+      my $align2_no_i;
+
+      # insertions exist
+      if (scalar(keys %hash_insertion) > 0) {
+         for (my $i = 0; $i < $align_length; $i++) {
+            my $base1 = substr($align1, $i, 1);
+
+            unless ($base1 eq "-") {
+               $align1_no_i .= $base1;
+               $align2_no_i .= substr($align2, $i, 1);
+            }
+         }
+      }
+      # insertions do not exist
+      else {
+         $align1_no_i = $align1;
+         $align2_no_i = $align2;
+      }
+
+      # find deletions and substitutions
+      my $align_no_i_length = length($align1_no_i);
+
+      for (my $i = 0; $i < $align_no_i_length; $i++) {
+         my $base1 = substr($align1_no_i, $i, 1);
+         my $base2 = substr($align2_no_i, $i, 1);
+
+         if ($base1 ne $base2) {
+            # deletion
+            # $base1: A/C/G/T
+            # $base2: -
+            if ($base2 eq "-") {
+               $hash_deletion{$i + 1} = $base1;
+
+               $num_deletions_local++;
+            }
+            else {
+               $hash_substitution_org{$i + 1} = $base1;
+               $hash_substitution_err{$i + 1} = $base2;
+
+               $num_substitutions_local++;
+            }
+         }
+      }
+
+      #--------------------------------------------------
+      # print errors
+      #--------------------------------------------------
+      # <read name> <ref 1 or 2> <ref name> <strand> <start index> <read length> <substitutions> <insertions> <deletions>
+      # ref 1 or 2 : always 1
+      # ref name   : "-"
+      # start index: 0
+      print $fh_error_location "$read_id 1 - $strand 0 $read_length";
+
+      #--------------------------------------------------
+      # substitution
+      #--------------------------------------------------
+      # substitutions exist
+      if (scalar (keys %hash_substitution_org) > 0) {
+         print $fh_error_location " ";
+
+         foreach my $each_index (sort keys %hash_substitution_org) {
+            print $fh_error_location "${each_index}:$hash_substitution_org{$each_index}->$hash_substitution_err{$each_index};";
+         }
+      }
+      # substitutions do not exist
+      else {
+         print $fh_error_location " -";
+      }
+
+      #--------------------------------------------------
+      # insertion
+      #--------------------------------------------------
+      # insertions exist
+      if (scalar (keys %hash_insertion) > 0) {
+         print $fh_error_location " ";
+
+         foreach my $each_index (sort keys %hash_insertion) {
+            print $fh_error_location "${each_index}:$hash_insertion{$each_index};";
+         }
+      }
+      # insertions do not exist
+      else {
+         print $fh_error_location " -";
+      }
+
+      #--------------------------------------------------
+      # deletion
+      #--------------------------------------------------
+      # deletions exist
+      if (scalar (keys %hash_deletion) > 0) {
+         print $fh_error_location " ";
+
+         foreach my $each_index (sort keys %hash_deletion) {
+            print $fh_error_location "${each_index}:$hash_deletion{$each_index};";
+         }
+      }
+      # deletions do not exist
+      else {
+         print $fh_error_location " -";
+      }
+
+      print $fh_error_location "\n";
+   }
+   else {
+      print $fh_error_location "$read_id N/A\n";
+   }
+}
+
+
+#----------------------------------------------------------------------
+# check_sequence
+#----------------------------------------------------------------------
+sub check_sequence {
+  my ($seq) = @_;
+
+  $seq = uc $seq;
+
+  my $seq_tmp = $seq;
+  # characters in $alphabets
+  $seq_tmp =~ tr/ACGT//d;
+
+   if ($seq_tmp ne "") {
+      die "\nERROR: Illegal characters exist $seq\n\n";
+   }
+   elsif (length($seq) > $max_seq_length) {
+      die "\nERROR: The sequence is too long $seq\n\n";
+   }
+
+   return $seq;
+}
+
+
+#----------------------------------------------------------------------
+# merge_output_files
+#----------------------------------------------------------------------
+sub merge_output_files {
+   if ($rank == 0) {
+      print  "Merging output files\n";
+   }
+
+   my @array_fh;
+   my @array_file_name;
+
+   # open the output files
+   # local files
+   for (my $i = 0; $i < $num_procs; $i++) {
+      my $i_text = sprintf "%0*d", 3, $i;
+
+      $array_file_name[$i] = $prefix . ".location". "." . $i_text;
+
+      open $array_fh[$i], "$array_file_name[$i]"
+         or die "\nERROR: Cannot open $array_file_name[$i]";
+   }
+
+   # final output file
+   open FH_OUT, ">$out_error_location_file"
+      or die "\nERROR: Cannot open $out_error_location_file\n\n";
+
+   # write a final output file
+   while (my $line = readline($array_fh[0])) {
+      print FH_OUT $line;
+
+      for (my $i = 1; $i < $num_procs; $i++) {
+         $line = readline($array_fh[$i]);
+
+         if (defined($line)) {
+            print FH_OUT $line;
+         }
+      }
+   }
+
+   # close the output files
+   for (my $i = 0; $i < $num_procs; $i++) {
+      close $array_fh[$i];
+
+      # remove the local files
+      unlink $array_file_name[$i];
+   }
+
+   close $out_error_location_file;
+
+   if ($rank == 0) {
+      print  "     Merging output files: done\n";
+   }
+}

@@ -1,0 +1,1235 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use File::Basename;
+use Getopt::Long;
+
+# these modules should be installed
+eval {
+   use Bio::DB::Sam;
+};
+if ($@) {
+   die "\nERROR: Module Bio::DB::Sam is not installed\n\n";
+}
+
+eval {
+   use Sys::CPU;
+};
+if ($@) {
+   die "\nERROR: Module Sys::CPU is not installed\n\n";
+}
+
+# use the library for version control
+my $directory;
+BEGIN {$directory = dirname $0;} 
+use lib "${directory}/../lib";
+
+if (!-e "${directory}/../lib/version.pm") {
+   die "\nERROR: ${directory}/../lib/version.pm does not exist\n\n";
+}
+use version;
+
+# turn on auto flush
+$| = 1;
+
+my $program_name                  = basename $0;
+my $date                          = $version::date;
+my $version                       = $version::version;
+my $num_target_genome_pairs       = 0;
+my $num_non_target_genome_pairs   = 0;
+my $num_no_info_pairs             = 0;
+my $num_correctly_aligned_pairs   = 0;
+my $num_wrongly_aligned_pairs     = 0;
+my $num_unaligned_pairs           = 0;
+my $write_order_binary            = "write-order-file.sam.paired.common";
+my $flag_aligned_pair             = 0x0002;
+my $flag_first                    = 0x0040;
+my $flag_second                   = 0x0080;
+my $num_uncoverted_bases_ref      = 0;
+my $num_total_bases_ref           = 0;
+my $num_total_bases_aligned_reads = 0;
+my $max_threads_for_sorting       = 8;
+my $sambamba                      = "${directory}/sambamba/sambamba_v0.5.4";
+
+# input arguments
+my $location_file;
+my $sam_file;
+my $tmp_dir;
+my $prefix;
+my $genome_1_or_2;
+my $strict;
+my $noout;
+my $in_num_threads;
+
+my $help;
+my $sorted_using_order_sam_file;
+my $sorted_using_position_bam_file;
+my $out_order_file;
+# MATCHED      this pair is aligned to a correct position
+# MISMATCHED : this pair is aligned to a wrong position
+# UNALIGNED  : at least one read in the pair is not aligned
+# DIFF-GENOME: this pair comes from a different genome
+my $out_align_summary;
+my $out_log_file;
+
+my $total_length                       = 0;
+my $total_uncovered_length             = 0;
+my $total_multiple_aligned_read_length = 0;
+my $total_once_aligned_read_length     = 0;
+
+my %hash_chr_length;
+my %hash_chr_uncovered_length;
+my %hash_chr_read_coverage;
+my %hash_chr_total_multiple_aligned_read_length;
+
+my $header =
+"
+----------------------------------------------------------------------
+PROGRAM: $program_name
+CONTACT: Yun Heo (yunheo1\@illinois.edu)
+VERSION: $version
+DATE   : $date
+----------------------------------------------------------------------
+\n";
+
+my $usage =
+"USAGE: $program_name <ARGUMENTS>
+
+ARGUMENT          DESCRIPTION                   MANDATORY      DEFAULT
+----------------------------------------------------------------------
+-genome <1 or 2>  reference genome 1 or 2       Y
+-h                print help                    N
+-location <file>  error location file           Y
+-noout            write no output file          N
+-prefix <string>  output prefix                 Y
+-sam      <file>  input sam file                Y
+-strict           use the strict matching       N
+-thread    <num>  number of threads for sorting N              # cores
+-t         <dir>  temporary directory for sort  N
+----------------------------------------------------------------------
+\n";
+
+
+
+######################################################################
+# main code
+######################################################################
+
+&print_header;
+
+&parse_arguments;
+
+&write_order_file;
+
+# sort the sam file using the order file
+&sort_sam_file_using_order_file;
+
+# compare the sam file with the location file
+&compare;
+
+# sort the sam file using aligned positions
+&sort_sam_file_using_aligned_position;
+
+# calculate coverage
+&coverage;
+
+#--------------------------------------------------
+# print outputs to stdout
+#--------------------------------------------------
+print  "\n";
+print  "----------------------------------------------------------------------\n";
+print  "Summary of Outputs\n";
+print  "----------------------------------------------------------------------\n";
+print  "1. Number of pairs\n";
+printf "     Number of pairs /w location info (current genome)  (A): %12d pairs\n",   $num_target_genome_pairs;
+printf "     Number of pairs /w location info (differnt genome) (B): %12d pairs\n",   $num_non_target_genome_pairs;
+printf "     Number of pairs /wo location info                  (C): %12d pairs\n",   $num_no_info_pairs;
+printf "     Number of correctly aligned pairs                  (D): %12d pairs\n",   $num_correctly_aligned_pairs;
+printf "     Number of wrongly aligned pairs                    (E): %12d pairs\n",   $num_wrongly_aligned_pairs;
+printf "     Number of unaligned pairs                          (F): %12d pairs\n\n", $num_unaligned_pairs;
+
+printf "     Total number of pairs                : A + B + C       = %12d\n", $num_target_genome_pairs + $num_non_target_genome_pairs + $num_no_info_pairs;
+printf "     Number of pairs from genome %d        : D + E + F       = %12d\n", $genome_1_or_2, $num_target_genome_pairs;
+
+if (($num_correctly_aligned_pairs + $num_wrongly_aligned_pairs + $num_unaligned_pairs) == 0) {
+   printf "     Percentage of aligned pairs          : D / (D + E + F) = N/A\n";
+}
+else {
+   printf "     Percentage of aligned pairs          : D / (D + E + F) = %6.2f (%%)\n", 100.0 * $num_correctly_aligned_pairs / ($num_correctly_aligned_pairs + $num_wrongly_aligned_pairs + $num_unaligned_pairs);
+}
+
+if (($num_correctly_aligned_pairs + $num_wrongly_aligned_pairs) == 0) {
+   printf "     Percentage of correctly aligned pairs: D / (D + E)     = N/A\n";
+   printf "     Percentage of wrongly aligned pairs  : E / (D + E)     = N/A\n";
+}
+else {
+   printf "     Percentage of correctly aligned pairs: D / (D + E)     = %6.2f (%%)\n", 100.0 * $num_correctly_aligned_pairs / ($num_correctly_aligned_pairs + $num_wrongly_aligned_pairs);
+   printf "     Percentage of wrongly aligned pairs  : E / (D + E)     = %6.2f (%%)\n", 100.0 * $num_wrongly_aligned_pairs / ($num_correctly_aligned_pairs + $num_wrongly_aligned_pairs);
+}
+
+print  "\n";
+print  "2. Chromosome Coverage (Each pair can be aligned to multiple locations)\n";
+foreach my $each_key (sort keys %hash_chr_length) {
+   if ($hash_chr_length{$each_key} == 0) {
+      printf "     %-100s: Chromosome length is 0\n", $each_key;
+   }
+   else {
+      printf "     %-100s: %11d out of %11d bases (%5.1f %%)\n",
+         $each_key,
+         $hash_chr_length{$each_key} - $hash_chr_uncovered_length{$each_key},
+         $hash_chr_length{$each_key},
+         100.0 * ($hash_chr_length{$each_key} - $hash_chr_uncovered_length{$each_key}) / $hash_chr_length{$each_key};
+   }
+
+   $total_uncovered_length += $hash_chr_uncovered_length{$each_key};
+}
+
+printf "     %s\n", "-" x 148;
+if ($total_length == 0) {
+   printf "     %-100s: Genome length is 0\n", "Entire Chromosomes", $total_uncovered_length, $total_length;
+}
+else {
+   printf "     %-100s: %11d out of %11d bases (%5.1f %%)\n",
+      "Entire Chromosomes",
+      $total_length - $total_uncovered_length,
+      $total_length,
+      100.0 * ($total_length - $total_uncovered_length) / $total_length;
+}
+
+print "\n";
+print "3. Read Coverage\n";
+print "     1) When each pair can be aligned to multiple locations\n";
+foreach my $each_key (sort keys %hash_chr_length) {
+   if ($hash_chr_length{$each_key} == 0) {
+      printf "          %-100s: N/A\n", $each_key;
+   }
+   else {
+      printf "          %-100s: %7.2f times\n", $each_key, 1.0 * $hash_chr_total_multiple_aligned_read_length{$each_key} / $hash_chr_length{$each_key};
+   }
+
+   $total_multiple_aligned_read_length  += $hash_chr_total_multiple_aligned_read_length{$each_key};
+}
+
+printf "          %s\n", "-" x 115;
+if ($total_multiple_aligned_read_length == 0) {
+   printf "          %-100s: N/A\n", "Entire Chromosomes";
+}
+else {
+   printf "          %-100s: %7.2f times\n", "Entire Chromosomes", 1.0 * $total_multiple_aligned_read_length / $total_length;
+}
+
+print "\n";
+print "     2) When pairs that are aligned in correct positions are counted\n";
+printf "          %-100s: %7.2f times\n", "Entire Chromosomes", 1.0 * $total_once_aligned_read_length / $total_length;
+
+#--------------------------------------------------
+# write a log file
+#--------------------------------------------------
+open FH_LOG, ">$out_log_file"
+   or die "\nERROR: Cannot open $out_log_file\n\n";
+
+print FH_LOG  "1. Number of pairs\n";
+printf FH_LOG "     Number of pairs /w location info (current genome)  (A): %12d pairs\n",   $num_target_genome_pairs;
+printf FH_LOG "     Number of pairs /w location info (differnt genome) (B): %12d pairs\n",   $num_non_target_genome_pairs;
+printf FH_LOG "     Number of pairs /wo location info                  (C): %12d pairs\n",   $num_no_info_pairs;
+printf FH_LOG "     Number of correctly aligned pairs                  (D): %12d pairs\n",   $num_correctly_aligned_pairs;
+printf FH_LOG "     Number of wrongly aligned pairs                    (E): %12d pairs\n",   $num_wrongly_aligned_pairs;
+printf FH_LOG "     Number of unaligned pairs                          (F): %12d pairs\n\n", $num_unaligned_pairs;
+
+printf FH_LOG "     Total number of pairs                : A + B + C       = %12d\n", $num_target_genome_pairs + $num_non_target_genome_pairs + $num_no_info_pairs;
+printf FH_LOG "     Number of pairs from genome %d        : D + E + F       = %12d\n", $genome_1_or_2, $num_target_genome_pairs;
+
+if (($num_correctly_aligned_pairs + $num_wrongly_aligned_pairs + $num_unaligned_pairs) == 0) {
+   printf FH_LOG "     Percentage of aligned pairs          : D / (D + E + F) = N/A\n";
+}
+else {
+   printf FH_LOG "     Percentage of aligned pairs          : D / (D + E + F) = %6.2f (%%)\n", 100.0 * $num_correctly_aligned_pairs / ($num_correctly_aligned_pairs + $num_wrongly_aligned_pairs + $num_unaligned_pairs);
+}
+
+if (($num_correctly_aligned_pairs + $num_wrongly_aligned_pairs) == 0) {
+   printf FH_LOG "     Percentage of correctly aligned pairs: D / (D + E)     = N/A\n";
+   printf FH_LOG "     Percentage of wrongly aligned pairs  : E / (D + E)     = N/A\n";
+}
+else {
+   printf FH_LOG "     Percentage of correctly aligned pairs: D / (D + E)     = %6.2f (%%)\n", 100.0 * $num_correctly_aligned_pairs / ($num_correctly_aligned_pairs + $num_wrongly_aligned_pairs);
+   printf FH_LOG "     Percentage of wrongly aligned pairs  : E / (D + E)     = %6.2f (%%)\n", 100.0 * $num_wrongly_aligned_pairs / ($num_correctly_aligned_pairs + $num_wrongly_aligned_pairs);
+}
+
+print FH_LOG  "\n";
+print FH_LOG  "2. Chromosome Coverage (Each pair can be aligned to multiple locations)\n";
+foreach my $each_key (sort keys %hash_chr_length) {
+   if ($hash_chr_length{$each_key} == 0) {
+      printf FH_LOG "     %-100s: Chromosome length is 0\n", $each_key;
+   }
+   else {
+      printf FH_LOG "     %-100s: %11d out of %11d bases (%5.1f %%)\n",
+         $each_key,
+         $hash_chr_length{$each_key} - $hash_chr_uncovered_length{$each_key},
+         $hash_chr_length{$each_key},
+         100.0 * ($hash_chr_length{$each_key} - $hash_chr_uncovered_length{$each_key}) / $hash_chr_length{$each_key};
+   }
+
+   $total_uncovered_length += $hash_chr_uncovered_length{$each_key};
+}
+
+printf FH_LOG "     %s\n", "-" x 148;
+if ($total_length == 0) {
+   printf FH_LOG "     %-100s: Genome length is 0\n", "Entire Chromosomes", $total_uncovered_length, $total_length;
+}
+else {
+   printf FH_LOG "     %-100s: %11d out of %11d bases (%5.1f %%)\n",
+      "Entire Chromosomes",
+      $total_length - $total_uncovered_length,
+      $total_length,
+      100.0 * ($total_length - $total_uncovered_length) / $total_length;
+}
+
+print FH_LOG "\n";
+print FH_LOG "3. Read Coverage\n";
+print FH_LOG "     1) When each pair can be aligned to multiple locations\n";
+foreach my $each_key (sort keys %hash_chr_length) {
+   if ($hash_chr_length{$each_key} == 0) {
+      printf FH_LOG "          %-100s: N/A\n", $each_key;
+   }
+   else {
+      printf FH_LOG "          %-100s: %7.2f times\n", $each_key, 1.0 * $hash_chr_total_multiple_aligned_read_length{$each_key} / $hash_chr_length{$each_key};
+   }
+
+   $total_multiple_aligned_read_length  += $hash_chr_total_multiple_aligned_read_length{$each_key};
+}
+
+printf FH_LOG "          %s\n", "-" x 115;
+if ($total_multiple_aligned_read_length == 0) {
+   printf FH_LOG "          %-100s: N/A\n", "Entire Chromosomes";
+}
+else {
+   printf FH_LOG "          %-100s: %7.2f times\n", "Entire Chromosomes", 1.0 * $total_multiple_aligned_read_length / $total_length;
+}
+
+print FH_LOG "\n";
+print FH_LOG "     2) When pairs that are aligned in correct positions are counted\n";
+printf FH_LOG "          %-100s: %7.2f times\n", "Entire Chromosomes", 1.0 * $total_once_aligned_read_length / $total_length;
+
+close FH_LOG;
+
+print "\n####################### SUCCESSFULLY COMPLETED #######################\n\n";
+
+######################################################################
+# end of main code
+######################################################################
+
+
+
+#---------------------------------------------------------------------
+# print_header
+#---------------------------------------------------------------------
+sub print_header {
+   print $header;
+}
+
+
+
+#---------------------------------------------------------------------
+# parse_arguments
+#---------------------------------------------------------------------
+sub parse_arguments {
+   my $base_name;
+
+   if (@ARGV == 0) {
+      die $usage;
+   }
+
+   print "Parsing arguments\n";
+
+   if (!GetOptions (
+                    "genome=i"   => \$genome_1_or_2,
+                    "h"          => \$help,
+                    "prefix=s"   => \$prefix,
+                    "location=s" => \$location_file,
+                    "noout"      => \$noout,
+                    "sam=s"      => \$sam_file,
+                    "strict"     => \$strict,
+                    "t=s"        => \$tmp_dir,
+                   )
+       or $help) {
+      die $usage;
+   }
+
+   # location file
+   if (!defined($location_file)) {
+      die "\nERROR: The location file name should be specified\n\n";
+   }
+   elsif (!(open FH_TEMP, "$location_file")) {
+      die "\nERROR: Cannot open $location_file\n\n";
+   }
+   close FH_TEMP;
+
+   # sam file
+   if (!defined($sam_file)) {
+      die "\nERROR: An input sam file name should be specified\n\n";
+   }
+   elsif (!(open FH_TEMP, "$sam_file")) {
+      die "\nERROR: Cannot open $sam_file\n\n";
+   }
+   close FH_TEMP;
+
+   # specify a genome
+   if (defined($genome_1_or_2)) {
+      if (($genome_1_or_2 != 1) && ($genome_1_or_2 != 2)) {
+         die "\nERROR: The genome option should be 1 or 2\n\n";
+      }
+   }
+   else {
+      die "\nERROR: The genome used (1 or 2) should be specified\n\n";
+   }
+
+   # tmp directory for sorting
+   if (defined($tmp_dir)) {
+      if (!-d $tmp_dir) {
+         die "\nERROR: $tmp_dir does not exist (or it is not a directory)\n\n";
+      }
+   }
+
+   # prefix
+   if (defined($prefix)) {
+      $out_order_file                   = $prefix . ".order";
+      $out_log_file                     = $prefix . ".log";
+      $out_align_summary                = $prefix . ".align-summary";
+      $sorted_using_order_sam_file      = $prefix . ".sorted.order.sam";
+      $sorted_using_position_bam_file   = $prefix . ".sorted.position.bam";
+   }
+   else {
+      die "\nERROR: The output file prefix should be defined\n\n";
+   }
+
+   # number of threads
+   if (defined($in_num_threads)) {
+      if ($in_num_threads > $max_threads_for_sorting) {
+         print "     \nWARNING: Using over $max_threads_for_sorting threads for sorting degrades performance; $max_threads_for_sorting threads will be used\n\n";
+         $in_num_threads = $max_threads_for_sorting;
+      }
+   }
+   else {
+      if (Sys::CPU::cpu_count() > $max_threads_for_sorting) {
+         $in_num_threads = $max_threads_for_sorting;
+      }
+      else {
+         $in_num_threads = Sys::CPU::cpu_count();
+      }
+   }
+
+   print "     Parsing argumetns: done\n\n";
+}
+
+
+
+#---------------------------------------------------------------------
+# write_order_file
+#---------------------------------------------------------------------
+sub write_order_file {
+   print "Extracting the order of input reads\n";
+
+   if (!-e "${directory}/${write_order_binary}") {
+      die "\nERROR: ${directory}/${write_order_binary} does not exist\n\n";
+   }
+
+   my $log = system("${directory}/${write_order_binary} $location_file $sam_file $out_order_file");
+   if ($log != 0) {
+      die "ERROR: ${write_order_binary} is not successfully finished\n\n";
+   }
+
+   if (!-e $out_order_file) {
+      die "\nERROR: $out_order_file is not generated\n\n";
+   }
+
+   print "     Extracting the order of input reads: done\n\n";
+}
+
+
+
+#---------------------------------------------------------------------
+# sort_sam_file_using_order_file
+#---------------------------------------------------------------------
+sub sort_sam_file_using_order_file {
+   print "Sorting the sam file using the order file\n";
+
+   # check whether sort support multithreads
+   my $check_log;
+   my $support_parallel;
+
+   $check_log        = `sort --parallel 2>&1`;
+   $support_parallel = 0;
+
+   if ($check_log =~ /requires an argument/) {
+      $support_parallel = 1;
+   }
+
+   $ENV{compare_location_sam_order}  = $out_order_file;
+   $ENV{compare_location_sam_input}  = $sam_file;
+   $ENV{compare_location_sam_output} = $sorted_using_order_sam_file;
+   $ENV{bam2location_core}           = $in_num_threads;
+
+   my $cmd;
+
+   if (defined($tmp_dir)) {
+      $ENV{compare_location_sam_tmp} = $tmp_dir;
+      # the header is needed
+      if ($support_parallel == 1) {
+         $cmd = q{sed -n -e '/^@/p' $compare_location_sam_input > $compare_location_sam_output; sed '/^\@/d' $compare_location_sam_input | awk '{printf("%s%s", $0, (NR % 2 == 0) ? "\n" : "\v")}' | paste $compare_location_sam_order - | sort --parallel=$bam2location_core -T $compare_location_sam_tmp -k1 -n | cut -f 2- |  tr "\v" "\n" >> $compare_location_sam_output};
+      }
+      else {
+         $cmd = q{sed -n -e '/^@/p' $compare_location_sam_input > $compare_location_sam_output; sed '/^\@/d' $compare_location_sam_input | awk '{printf("%s%s", $0, (NR % 2 == 0) ? "\n" : "\v")}' | paste $compare_location_sam_order - | sort -T $compare_location_sam_tmp -k1 -n | cut -f 2- |  tr "\v" "\n" >> $compare_location_sam_output};
+      }
+   }   
+   else {
+      # the header is needed
+      if ($support_parallel == 1) {
+         $cmd = q{sed -n -e '/^@/p' $compare_location_sam_input > $compare_location_sam_output; sed '/^\@/d' $compare_location_sam_input | awk '{printf("%s%s", $0, (NR % 2 == 0) ? "\n" : "\v")}' | paste $compare_location_sam_order - | sort --parallel=$bam2location_core -k1 -n | cut -f 2- |  tr "\v" "\n" >> $compare_location_sam_output};
+      }
+      else {
+         $cmd = q{sed -n -e '/^@/p' $compare_location_sam_input > $compare_location_sam_output; sed '/^\@/d' $compare_location_sam_input | awk '{printf("%s%s", $0, (NR % 2 == 0) ? "\n" : "\v")}' | paste $compare_location_sam_order - | sort -k1 -n | cut -f 2- |  tr "\v" "\n" >> $compare_location_sam_output};
+      }
+   }   
+
+   system($cmd);
+
+   unlink $out_order_file;
+
+   print "     Sorting the sam file using the order file: done\n\n";
+}
+
+
+
+#---------------------------------------------------------------------
+# compare
+#---------------------------------------------------------------------
+sub compare {
+   print "Comparing reads\n";
+
+   open FH_LOCATION, "$location_file"
+      or die "\nERROR: Cannot open $location_file\n\n";
+
+   my $sam = Bio::DB::Tam->open($sorted_using_order_sam_file);
+   if (!defined($sam)) {
+      die "\nERROR: Cannot open $sorted_using_order_sam_file\n\n";
+   }
+
+   # output alignment summary file
+   if (!defined($noout)) {
+      open FH_ALIGN, ">$out_align_summary"
+         or die "\nERROR: Cannot open $out_align_summary\n\n";
+   }
+
+   # read header
+   my $sam_header      = $sam->header_read;
+   my $sam_target_name = $sam_header->target_name;
+
+   my $alignment1_tmp = Bio::DB::Bam::Alignment->new;
+   my $alignment2_tmp = Bio::DB::Bam::Alignment->new;
+   my $alignment1     = Bio::DB::Bam::Alignment->new;
+   my $alignment2     = Bio::DB::Bam::Alignment->new;
+
+   # sam
+   my $flag_sam_file_end      = 0;
+   my $read_name_sam_1st_prev = "";
+
+   my $read_name_sam_1st;
+   my $strand_sam_1st;
+   my $reference_sam_1st;
+   my $position_sam_1st;
+   my $sequence_sam_1st;
+   my $flag_sam_1st;
+   my $aligned_sam_1st;
+
+   my $read_name_sam_2nd;
+   my $strand_sam_2nd;
+   my $reference_sam_2nd;
+   my $position_sam_2nd;
+   my $sequence_sam_2nd;
+   my $flag_sam_2nd;
+   my $aligned_sam_2nd;
+
+   # location
+   my $read_name_location_1st;
+   my $reference_location_1st;
+   my $strand_location_1st;
+   my $position_location_1st;
+   my $insertion_location_1st;
+   my $deletion_location_1st;
+
+   my $read_name_location_2nd;
+   my $reference_location_2nd;
+   my $strand_location_2nd;
+   my $position_location_2nd;
+   my $insertion_location_2nd;
+   my $deletion_location_2nd;
+
+   # read the first item from the sam file
+   if (($sam->read1($sam_header, $alignment1_tmp) > 0) && ($sam->read1($sam_header, $alignment2_tmp) > 0)) {
+      if ((($alignment1_tmp->flag & $flag_first) == $flag_first) && (($alignment2_tmp->flag & $flag_second) == $flag_second)) {
+         $alignment1 = $alignment1_tmp;
+         $alignment2 = $alignment2_tmp;
+      }
+      elsif ((($alignment1_tmp->flag & $flag_second) == $flag_second) && (($alignment2_tmp->flag & $flag_first) == $flag_first)) {
+         $alignment1 = $alignment2_tmp;
+         $alignment2 = $alignment1_tmp;
+      }
+      else {
+         my $name1 = $alignment1->qname;
+         my $name2 = $alignment2->qname;
+
+         die "\nERROR: Not pair-aligned reads $name1 $name2\n\n";
+      }
+   }
+   else {
+      die "\nERROR: Empty sam file\n\n";
+   }
+
+   # iterate the location file
+   my $flag_location_file_end = 0;
+   while (($flag_location_file_end == 0) && ($flag_sam_file_end == 0)) {
+      #--------------------------------------------------
+      # read a pair from the location file
+      #--------------------------------------------------
+      # forward
+      if (my $line_location_1st = <FH_LOCATION>) {
+         # information exists
+         # <read name> <ref 1 or 2> <ref name> <strand> <start index> <read length> <substitutions> <insertions> <deletions>
+         if ($line_location_1st =~ /^(\S+)\s+([12])\s+(\S+)\s+([\+\-])\s+([\d\-]+)\s+(\d+)\s+\S+\s+(\S+)\s+(\S+)/) {
+            my $read_name_location_1st   = $1;
+            my $genome_1_or_2_1st        = $2;
+            my $reference_location_1st   = $3;
+            my $strand_location_1st      = $4;
+            my $position_location_1st    = $5; # start from 1
+            my $read_length_location_1st = $6;
+            my $insertion_location_1st   = $7;
+            my $deletion_location_1st    = $8;
+
+            # reverse
+            my $line_location_2nd = <FH_LOCATION>;
+
+            if (!defined($line_location_2nd)) {
+               die "\nERROR: Fail to get the next line of $line_location_1st\n";
+            }
+
+            # <read name> <ref 1 or 2> <ref name> <strand> <start index> <read length> <substitutions> <insertions> <deletions
+            if ($line_location_2nd =~ /^(\S+)\s+([12])\s+(\S+)\s+([\+\-])\s+([\d\-]+)\s+(\d+)\s+\S+\s+(\S+)\s+(\S+)/) {
+               my $read_name_location_2nd   = $1;
+               my $genome_1_or_2_2nd        = $2;
+               my $reference_location_2nd   = $3;
+               my $strand_location_2nd      = $4;
+               my $position_location_2nd    = $5; # start from 1
+               my $read_length_location_2nd = $6;
+               my $insertion_location_2nd   = $7;
+               my $deletion_location_2nd    = $8;
+
+               # check genomes
+               if ($genome_1_or_2_1st != $genome_1_or_2_2nd) {
+                  die "\nERROR: $read_name_location_1st and $read_name_location_2nd come from different genomes\n\n";
+               }
+
+               # remove identifiers from read names
+               my $read_name_location_org_1st = $read_name_location_1st;
+               my $read_name_location_org_2nd = $read_name_location_2nd;
+
+               # matched genome
+               if ($genome_1_or_2_1st == $genome_1_or_2) {
+                  # count
+                  $num_target_genome_pairs++;
+                  if (($num_target_genome_pairs + $num_non_target_genome_pairs + $num_no_info_pairs) % 100000 == 0) {
+                     printf "     %12d pairs are processed\n", $num_target_genome_pairs + $num_non_target_genome_pairs + $num_no_info_pairs;
+                  }
+
+                  $read_name_location_1st =~ s/\/1$//;
+                  $read_name_location_2nd =~ s/\/2$//;
+
+                  # modify strand information
+                  if (($strand_location_1st eq "+") && ($strand_location_2nd eq "-")) {
+                     $strand_location_1st = 1;
+                     $strand_location_2nd = -1;
+                  }
+                  elsif (($strand_location_1st eq "-") && ($strand_location_2nd eq "+")) {
+                     $strand_location_1st = -1;
+                     $strand_location_2nd = 1;
+                  }
+                  else {
+                     die "\nERROR: Irregular strand in $read_name_location_1st and $read_name_location_2nd ($strand_location_1st $strand_location_2nd)\n\n";
+                  }
+
+                  # insertion
+                  my $num_insertions_location_1st = 0;
+                  my $num_insertions_location_2nd = 0;
+
+                  unless ($insertion_location_1st eq "-") {
+                     while ($insertion_location_1st =~ /\d+:([ACGT]+);/g) {
+                        $num_insertions_location_1st += (length $1);
+                     }
+                  }  
+
+                  unless ($insertion_location_2nd eq "-") {
+                     while ($insertion_location_2nd =~ /\d+:([ACGT]+);/g) {
+                        $num_insertions_location_2nd += (length $1);
+                     }
+                  }  
+
+                  # deletion
+                  my $num_deletions_location_1st = 0;
+                  my $num_deletions_location_2nd = 0;
+
+                  unless ($deletion_location_1st eq "-") {
+                     while ($deletion_location_1st =~ /\d+:([ACGT]+);/g) {
+                        if ((length $1) != 1) {
+                           die "\nERROR: A multiple length deletion exists in $read_name_location_1st\n\n";
+                        }
+                        else {
+                           $num_deletions_location_1st++;
+                        }
+                     }
+                  }
+
+                  unless ($deletion_location_2nd eq "-") {
+                     while ($deletion_location_2nd =~ /\d+:([ACGT]+);/g) {
+                        if ((length $1) != 1) {
+                           die "\nERROR: A multiple length deletion exists in $read_name_location_2nd\n\n";
+                        }
+                        else {
+                           $num_deletions_location_2nd++;
+                        }
+                     }
+                  }
+
+                  #--------------------------------------------------
+                  # read all the pairs with the same name from the sam file
+                  #--------------------------------------------------
+                  my @sam_array_1st_strand;
+                  my @sam_array_1st_reference;
+                  my @sam_array_1st_start;
+                  my @sam_array_1st_end;
+                  my @sam_array_1st_flag;
+                  my @sam_array_1st_read_length;
+
+                  my @sam_array_2nd_strand;
+                  my @sam_array_2nd_reference;
+                  my @sam_array_2nd_start;
+                  my @sam_array_2nd_end;
+                  my @sam_array_2nd_flag;
+                  my @sam_array_2nd_read_length;
+
+                  # check the read name that was previouly read
+                  # its name should be matched with that of the location file
+                  my $name1_tmp = $alignment1->qname;
+                  my $name2_tmp = $alignment2->qname;
+
+                  if (($name1_tmp eq $read_name_location_1st) && ($name2_tmp eq $read_name_location_2nd)) {
+                     push (@sam_array_1st_strand,      $alignment1->strand);
+                     push (@sam_array_1st_reference,   $sam_target_name->[$alignment1->tid]);
+                     push (@sam_array_1st_start,       $alignment1->start);
+                     push (@sam_array_1st_end,         $alignment1->end);
+                     push (@sam_array_1st_flag,        $alignment1->flag);
+                     push (@sam_array_1st_read_length, length($alignment1->query->dna));
+
+                     push (@sam_array_2nd_strand,      $alignment2->strand);
+                     push (@sam_array_2nd_reference,   $sam_target_name->[$alignment2->tid]);
+                     push (@sam_array_2nd_start,       $alignment2->start);
+                     push (@sam_array_2nd_end,         $alignment2->end);
+                     push (@sam_array_2nd_flag,        $alignment2->flag);
+                     push (@sam_array_2nd_read_length, length($alignment2->query->dna));
+
+                     # find the sam lines with the same name and push them into the arrays
+                     my $in_same_read = 1;
+                     while ($in_same_read == 1) {
+                        # read the next item from the sam file
+                        if (($sam->read1($sam_header, $alignment1_tmp) > 0) && ($sam->read1($sam_header, $alignment2_tmp) > 0)) {
+                           if ((($alignment1_tmp->flag & $flag_first) == $flag_first) && (($alignment2_tmp->flag & $flag_second) == $flag_second)) {
+                              $alignment1 = $alignment1_tmp;
+                              $alignment2 = $alignment2_tmp;
+                           }
+                           elsif ((($alignment1_tmp->flag & $flag_second) == $flag_second) && (($alignment2_tmp->flag & $flag_first) == $flag_first)) {
+                              $alignment1 = $alignment2_tmp;
+                              $alignment2 = $alignment1_tmp;
+                           }
+                           else {
+                              my $name1 = $alignment1->qname;
+                              my $name2 = $alignment2->qname;
+                     
+                              die "\nERROR: Not pair-aligned reads $name1 $name2\n\n";
+                           }
+
+                           $name1_tmp = $alignment1->qname;
+                           $name2_tmp = $alignment2->qname;
+
+                           # read names are matched
+                           # add them to the array and keep going
+                           if (($name1_tmp eq $read_name_location_1st) && ($name2_tmp eq $read_name_location_2nd)) {
+                              push (@sam_array_1st_strand,      $alignment1->strand);
+                              push (@sam_array_1st_reference,   $sam_target_name->[$alignment1->tid]);
+                              push (@sam_array_1st_start,       $alignment1->start);
+                              push (@sam_array_1st_end,         $alignment1->end);
+                              push (@sam_array_1st_flag,        $alignment1->flag);
+                              push (@sam_array_1st_read_length, length($alignment1->query->dna));
+
+                              push (@sam_array_2nd_strand,      $alignment2->strand);
+                              push (@sam_array_2nd_reference,   $sam_target_name->[$alignment2->tid]);
+                              push (@sam_array_2nd_start,       $alignment2->start);
+                              push (@sam_array_2nd_end,         $alignment2->end);
+                              push (@sam_array_2nd_flag,        $alignment2->flag);
+                              push (@sam_array_2nd_read_length, length($alignment2->query->dna));
+                           }
+                           # read names are not matched
+                           # all the sam lines with the same name were added to the array
+                           else {
+                              $in_same_read = 0;
+                           }
+                        }
+                        # no more same line
+                        else {
+                           # all the necessary sam lines were found
+                           $in_same_read = 0;
+
+                           # finish the comparison process
+                           $flag_sam_file_end = 1;
+                        }
+                     }
+
+                     #--------------------------------------------------
+                     # compare the location line with each of @sam_array*
+                     #--------------------------------------------------
+                     my $flag_matched = 0;
+                     my $flag_unaligned = 0;
+
+                     # calculate the start/end indices
+                     # start_index: 5'-end side of the + strand
+                     # end_index  : 3'-end side of the + strand
+                     my $end_index_location_1st;
+                     my $end_index_location_2nd;
+
+                     # calculate the end indices
+                     $end_index_location_1st = $position_location_1st + ($read_length_location_1st - 1) - $num_insertions_location_1st + $num_deletions_location_1st;
+                     $end_index_location_2nd = $position_location_2nd + ($read_length_location_2nd - 1) - $num_insertions_location_2nd + $num_deletions_location_2nd;
+
+                     for (my $i = 0; $i < scalar(@sam_array_1st_strand); $i++) {
+                        # pairwise aligned reads
+                        if ((($sam_array_1st_flag[$i] & $flag_aligned_pair) == $flag_aligned_pair) && (($sam_array_2nd_flag[$i] & $flag_aligned_pair) == $flag_aligned_pair)) {
+                           # stands and reference sequences and matched
+                           if (($sam_array_1st_strand[$i] eq $strand_location_1st) &&
+                               ($sam_array_2nd_strand[$i] eq $strand_location_2nd) &&
+                               ($sam_array_1st_reference[$i] eq $reference_location_1st) &&
+                               ($sam_array_2nd_reference[$i] eq $reference_location_2nd)) {
+                              # compare the ranges
+                              # the start point may become smaller when an insertion is corrected
+                              # this can happen if an error correctin tool tries to keep read length same
+                              # ref     : AAAAAA-CCCCC
+                              # org read:   AAAATCCC  (read length: 8, insertion)
+                              # case1   :  AAAAA CCC  (read length: 8, decrease in forward reads)
+                              # case2   :   AAAA CCCC (read length: 8, decrease in reverse reads)
+                              #
+                              # on the other hand, deletions do not increase the range
+                              # deletion
+                              # ref     : AAAAAATCCCCC
+                              # org read:   AAAA-CCCC (read length: 8, deletion)
+                              # case1   :   AAAATCCC  (read length: 8, increase in reverse reads)
+                              # case2   :    AAATCCCC (read length: 8, increase in forward reads)
+
+                              if (defined($strict)) {
+                                 if (
+                                     ($sam_array_1st_start[$i] == $position_location_1st) &&
+                                     ($sam_array_1st_end[$i]   == $end_index_location_1st) &&
+                                     ($sam_array_2nd_start[$i] == $position_location_2nd) &&
+                                     ($sam_array_2nd_end[$i]   == $end_index_location_2nd)
+                                    ) {
+                                       $flag_matched = 1;
+                                       $num_correctly_aligned_pairs++;
+
+                                       $total_once_aligned_read_length += ($sam_array_1st_read_length[$i] + $sam_array_2nd_read_length[$i]);
+
+                                       if (!defined($noout)) {
+                                          print FH_ALIGN "$read_name_location_org_1st $read_name_location_org_2nd MATCHED\n";
+                                       }
+
+                                       last;
+                                 }
+                              }
+                              else {
+                                 if (
+                                     ($sam_array_1st_start[$i] >= ($position_location_1st - $num_insertions_location_1st)) &&
+                                     ($sam_array_1st_end[$i]   <= ($end_index_location_1st   + $num_insertions_location_1st)) &&
+                                     ($sam_array_2nd_start[$i] >= ($position_location_2nd - $num_insertions_location_2nd)) &&
+                                     ($sam_array_2nd_end[$i]   <= ($end_index_location_2nd   + $num_insertions_location_2nd))
+                                    ) {
+                                       $flag_matched = 1;
+                                       $num_correctly_aligned_pairs++;
+
+                                       $total_once_aligned_read_length += ($sam_array_1st_read_length[$i] + $sam_array_2nd_read_length[$i]);
+
+                                       if (!defined($noout)) {
+                                          print FH_ALIGN "$read_name_location_org_1st $read_name_location_org_2nd MATCHED\n";
+                                       }
+
+                                       last;
+                                 }
+                              }
+                           }
+                        }
+                        # not pairwise aligned reads
+                        else {
+                           $flag_unaligned = 1;
+                           $num_unaligned_pairs++;
+
+                           if (!defined($noout)) {
+                              print FH_ALIGN "$read_name_location_org_1st $read_name_location_org_2nd UNALIGNED\n";
+                           }
+
+                           # check there is only one element in the array
+                           if ((scalar(@sam_array_1st_strand) != 1) || (scalar(@sam_array_2nd_strand) != 1)) {
+                              die "\nERROR: Multiple lines with unaligned reads $read_name_location_1st $read_name_location_2nd\n\n";
+                           }
+                        }
+                     }
+
+                     # no matched line in the sam file
+                     if ($flag_matched == 0) {
+                        # aligned read
+                        # this is a wrongly aligned read
+                        if ($flag_unaligned == 0) {
+                           $num_wrongly_aligned_pairs++;
+
+                           # write start indices to the log file
+                           if (!defined($noout)) {
+                              print FH_ALIGN "$read_name_location_org_1st $read_name_location_org_2nd MISMATCHED\n";
+                           }
+                        }
+                     }
+                  }
+                  else {
+                     #die "\nERROR: No corresponding sam information of $read_name_location_1st and $read_name_location_2nd\n\n";
+                     $num_unaligned_pairs++;
+
+                     if (!defined($noout)) {
+                        print FH_ALIGN "$read_name_location_org_1st $read_name_location_org_2nd UNALIGNED\n";
+                     }
+                  }
+               }
+               # not matched genome
+               # this pair does not need to be checked
+               else {
+                  $num_non_target_genome_pairs++;
+
+                  if (!defined($noout)) {
+                     print FH_ALIGN "$read_name_location_org_1st $read_name_location_org_2nd DIFF-GENOME\n";
+                  }
+
+                  if (($num_target_genome_pairs + $num_non_target_genome_pairs + $num_no_info_pairs) % 100000 == 0) {
+                     printf "     %12d pairs are processed\n", $num_target_genome_pairs + $num_non_target_genome_pairs + $num_no_info_pairs;
+                  }
+               }
+            }
+            # irregular line
+            # because the first read has the location information the second read should also have the location information
+            else {
+               die "\nERROR: $line_location_2nd\n\n";
+            }
+         }
+         # no information
+         # forward
+         elsif ($line_location_1st =~ /^(\S+)\s+N\/A\s*$/) {
+            my $read_name_location_1st = $1;
+
+            # reverse
+            my $line_location_2nd = <FH_LOCATION>;
+
+            if (!defined($line_location_2nd)) {
+               die "\nERROR: Fail to get the next line of $line_location_1st\n";
+            }
+
+            if ($line_location_2nd =~ /^(\S+)\s+N\/A\s*$/) {
+               my $read_name_location_2nd = $1;
+
+               # remove identifiers from read names
+               my $read_name_location_org_1st = $read_name_location_1st;
+               my $read_name_location_org_2nd = $read_name_location_2nd;
+
+               # count
+               $num_no_info_pairs++;
+               if (!defined($noout)) {
+                  print FH_ALIGN "$read_name_location_org_1st $read_name_location_org_2nd NO-INFO\n";
+               }
+
+               if (($num_target_genome_pairs + $num_non_target_genome_pairs + $num_no_info_pairs) % 100000 == 0) {
+                  printf "     %12d pairs are processed\n", $num_target_genome_pairs + $num_non_target_genome_pairs + $num_no_info_pairs;
+               }
+
+               $read_name_location_1st =~ s/\/1$//;
+               $read_name_location_2nd =~ s/\/2$//;
+
+               # find the sam lines with the same name and push them into the arrays
+               my $in_same_read = 1;
+               while ($in_same_read == 1) {
+                  # read the next item from the sam file
+                  if (($sam->read1($sam_header, $alignment1_tmp) > 0) && ($sam->read1($sam_header, $alignment2_tmp) > 0)) {
+                     if ((($alignment1_tmp->flag & $flag_first) == $flag_first) && (($alignment2_tmp->flag & $flag_second) == $flag_second)) {
+                        $alignment1 = $alignment1_tmp;
+                        $alignment2 = $alignment2_tmp;
+                     }
+                     elsif ((($alignment1_tmp->flag & $flag_second) == $flag_second) && (($alignment2_tmp->flag & $flag_first) == $flag_first)) {
+                        $alignment1 = $alignment2_tmp;
+                        $alignment2 = $alignment1_tmp;
+                     }
+                     else {
+                        my $name1 = $alignment1->qname;
+                        my $name2 = $alignment2->qname;
+               
+                        die "\nERROR: Not pair-aligned reads $name1 $name2\n\n";
+                     }
+
+                     my $name1_tmp = $alignment1->qname;
+                     my $name2_tmp = $alignment2->qname;
+
+                     # read names are not matched
+                     unless (($name1_tmp eq $read_name_location_1st) && ($name2_tmp eq $read_name_location_2nd)) {
+                        $in_same_read = 0;
+                     }
+                  }
+                  # no more same line
+                  else {
+                     # all the necessary sam lines were found
+                     $in_same_read = 0;
+
+                     # finish the comparison process
+                     $flag_sam_file_end = 1;
+                  }
+               }
+            }
+            # irregular line
+            else {
+               die "\nERROR: $line_location_2nd\n";
+            }
+         }
+         # irregular line
+         else {
+            die "\nERROR: $line_location_1st\n\n";
+         }
+      }
+      # no more locationmation file line
+      else {
+         $flag_location_file_end = 1;
+      }
+   }
+
+   #--------------------------------------------------
+   # read remaining location lines
+   #--------------------------------------------------
+   # forward
+   while (my $line_location_1st = <FH_LOCATION>) {
+      # information exists
+      if ($line_location_1st =~ /^(\S+)\s+([12])\s+\S+\s+[\+\-]\s+[\d\-]+\s+\d+\s+\S+\s+\S+\s+\S+/) {
+         my $read_name_location_1st = $1;
+         my $genome_1_or_2_1st      = $2;
+
+         # reverse
+         my $line_location_2nd = <FH_LOCATION>;
+
+         if (!defined($line_location_2nd)) {
+            die "\nERROR: Fail to get the next line of $line_location_1st\n";
+         }
+
+         if ($line_location_2nd =~ /^(\S+)\s+([12])\s+\S+\s+[\+\-]\s+[\d\-]+\s+\d+\s+\S+\s+\S+\s+\S+/) {
+            my $read_name_location_2nd = $1;
+            my $genome_1_or_2_2nd      = $2;
+
+            # check genomes
+            if ($genome_1_or_2_1st != $genome_1_or_2_2nd) {
+               die "\nERROR: $read_name_location_1st and $read_name_location_2nd come from different genomes\n\n";
+            }
+
+            my $read_name_location_org_1st = $read_name_location_1st;
+            my $read_name_location_org_2nd = $read_name_location_2nd;
+
+            # matched genome
+            if ($genome_1_or_2_1st == $genome_1_or_2) {
+               $read_name_location_1st =~ s/\/1$//;
+               $read_name_location_2nd =~ s/\/2$//;
+
+               # count
+               $num_target_genome_pairs++;
+               if (($num_target_genome_pairs + $num_non_target_genome_pairs + $num_no_info_pairs) % 100000 == 0) {
+                  printf "     %12d pairs are processed\n", $num_target_genome_pairs + $num_non_target_genome_pairs + $num_no_info_pairs;
+               }
+
+               $num_unaligned_pairs++;
+
+               if (!defined($noout)) {
+                  print FH_ALIGN "$read_name_location_org_1st $read_name_location_org_2nd UNALIGNED\n";
+               }
+            }
+            # not matched genome
+            # this pair does not need to be checked
+            else {
+               $num_non_target_genome_pairs++;
+
+               if (!defined($noout)) {
+                  print FH_ALIGN "$read_name_location_org_1st $read_name_location_org_2nd DIFF-GENOME\n";
+               }
+
+               if (($num_target_genome_pairs + $num_non_target_genome_pairs + $num_no_info_pairs) % 100000 == 0) {
+                  printf "     %12d pairs are processed\n", $num_target_genome_pairs + $num_non_target_genome_pairs + $num_no_info_pairs;
+               }
+            }
+         }
+         else {
+            die "\nERROR: $line_location_1st\n\n";
+         }
+      }
+      # no information
+      # forward
+      elsif ($line_location_1st =~ /^(\S+)\s+N\/A\s*$/) {
+         my $read_name_location_org_1st = $1;
+
+         # reverse
+         my $line_location_2nd = <FH_LOCATION>;
+
+         if (!defined($line_location_2nd)) {
+            die "\nERROR: Fail to get the next line of $line_location_1st\n";
+         }
+
+         if ($line_location_2nd =~ /^(\S+)\s+N\/A\s*$/) {
+            my $read_name_location_org_2nd = $1;
+
+            $num_no_info_pairs++;
+
+            if (!defined($noout)) {
+               print FH_ALIGN "$read_name_location_org_1st $read_name_location_org_2nd NO-INFO\n";
+            }
+         }
+         # irregular line
+         else {
+            die "\nERROR: $line_location_2nd\n\n";
+         }
+      }
+      # irregular line
+      else {
+         die "\nERROR: $line_location_1st\n\n";
+      }
+   }
+
+   close FH_LOCATION;
+   close FH_ALIGN;
+
+   unlink $sorted_using_order_sam_file;
+
+   print  "     Comparing reads: done\n\n";
+}
+
+
+
+#---------------------------------------------------------------------
+# sort_sam_file_using_aligned_position
+#---------------------------------------------------------------------
+sub sort_sam_file_using_aligned_position {
+   print "Sorting the sam file using the aligned positions of reads\n";
+
+   # check whether sort support multithreads
+   my $check_log;
+   my $support_parallel;
+
+   $check_log        = `sort --parallel 2>&1`;
+   $support_parallel = 0;
+
+   if ($check_log =~ /requires an argument/) {
+      $support_parallel = 1;
+   }
+
+   $ENV{sort_sam_file_align_in_sam}       = $sam_file;
+   $ENV{sort_sam_file_align_out_bam_file} = $sorted_using_position_bam_file;
+   $ENV{sort_sam_file_align_sambamba}     = $sambamba;
+   $ENV{bam2location_core}                = $in_num_threads;
+
+   my $cmd;
+
+   # generate a merged/sorted bam file
+   if ($support_parallel == 1) {
+      $cmd = q{$sort_sam_file_align_sambamba view -t $bam2location_core -F "proper_pair" -S -h -f bam $sort_sam_file_align_in_sam | $sort_sam_file_align_sambamba sort -o $sort_sam_file_align_out_bam_file -t $bam2location_core /dev/stdin};
+   }
+   else {
+      $cmd = q{$sort_sam_file_align_sambamba view -t $bam2location_core -F "proper_pair" -S -h -f bam $sort_sam_file_align_in_sam | $sort_sam_file_align_sambamba sort -o $sort_sam_file_align_out_bam_file /dev/stdin};
+   }
+   system ($cmd);
+
+   # generate the index file for the bam
+#   $cmd = q{$sort_sam_file_align_sambamba index -t $bam2location_core $sort_sam_file_align_out_bam_file};
+#   system ($cmd);
+
+   print "     Sorting the sam file using the aligned positions of reads: done\n\n";
+}
+
+
+
+#---------------------------------------------------------------------
+# coverage
+#---------------------------------------------------------------------
+sub coverage {
+   print "Calculate coverage of the reference sequence\n";
+
+   my $fh_bam = Bio::DB::Sam->new(-bam => $sorted_using_position_bam_file, -autoindex => 1);
+
+   my @chr_names = $fh_bam->seq_ids;
+
+   # get the chromosome length
+   foreach my $each_chr (@chr_names) {
+      my $length = $fh_bam->length($each_chr);
+
+      $hash_chr_length{$each_chr} = $length;
+      $hash_chr_uncovered_length{$each_chr} = 0;
+      $hash_chr_total_multiple_aligned_read_length{$each_chr} = 0;
+
+      $total_length += $length;
+   }
+
+   my $bam_iterator = $fh_bam->features(-iterator => 1);
+   my $prev_ref_name = "";
+   my $prev_end_index = 0;
+
+   #--------------------------------------------------
+   # chromosome coverage
+   #--------------------------------------------------
+   while (my $each_alignment = $bam_iterator->next_seq) {
+      my $start_index = $each_alignment->start;
+      my $end_index   = $each_alignment->end;
+      my $ref_name    = $each_alignment->seq_id;
+      my $read_length = length($each_alignment->query->dna);
+
+      if ($ref_name ne $prev_ref_name) {
+         if ($prev_ref_name ne "") {
+            # uncovered region in the previous chromosome
+            if (($hash_chr_length{$prev_ref_name} - $prev_end_index) > 0) {
+               $hash_chr_uncovered_length{$prev_ref_name} += ($hash_chr_length{$prev_ref_name} - $prev_end_index);
+            }
+         }
+
+         # reset the end index
+         $prev_end_index = 0;
+      }
+
+      # uncovered region
+      if (($start_index - $prev_end_index) > 1) {
+         $hash_chr_uncovered_length{$ref_name} += ($start_index - $prev_end_index + 1);
+      }
+
+      # total aligned read length
+      $hash_chr_total_multiple_aligned_read_length{$ref_name} += $read_length;
+
+      $prev_ref_name = $ref_name;
+      $prev_end_index = $end_index;
+   }
+
+   # uncovered regions at the end of the last chromosome
+   if ($prev_ref_name ne "") {
+      if (($hash_chr_length{$prev_ref_name} - $prev_end_index) > 0) {
+         $hash_chr_uncovered_length{$prev_ref_name} += ($hash_chr_length{$prev_ref_name} - $prev_end_index);
+      }
+   }
+
+   unlink $sorted_using_position_bam_file;
+
+   print "     Calculate coverage of the reference sequence: done\n\n";
+}

@@ -1,0 +1,208 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use File::Basename;
+use Getopt::Long;
+
+# use the library for version control
+my $directory;
+BEGIN {$directory = dirname $0;} 
+use lib "${directory}/../lib";
+
+if (!-e "${directory}/../lib/version.pm") {
+   die "\nERROR: ${directory}/../lib/version.pm does not exist\n\n";
+}
+use version;
+
+my $program_name = basename $0;
+
+my $date    = $version::date;
+my $version = $version::version;
+my $help;
+
+my $in_org_file;
+my $in_cor_file;
+my $in_out_file;
+
+my $header =
+"
+----------------------------------------------------------------------
+PROGRAM: $program_name
+AUTHOR : Yun Heo (yunheo1\@illinois.edu)
+VERSION: $version
+DATE   : $date
+----------------------------------------------------------------------
+\n";
+
+my $usage =
+"USAGE: $program_name <ARGUMENTS>
+
+ARGUMENT           DESCRIPTION               MANDATORY         DEFAULT
+----------------------------------------------------------------------
+-h                 print help                N
+-corfastq <file>   corrected fastq file      Y
+-orgfastq <file>   original fastq file       Y
+-outfastq <file>   output fastq file         Y
+----------------------------------------------------------------------
+\n";
+
+
+
+######################################################################
+# main code
+######################################################################
+
+&PrintHeader;
+&ParseArgs;
+&MergeFiles;
+
+print "\n####################### SUCCESSFULLY COMPLETED #######################\n\n";
+
+######################################################################
+# end of main code
+######################################################################
+
+
+
+sub PrintHeader {
+   print $header;
+}
+
+
+
+sub ParseArgs {
+   my $base_name;
+
+   if (@ARGV == 0) {
+      die $usage;
+   }
+
+   print "Parsing arguments\n";
+
+   if (!GetOptions (
+                     "h"          => \$help,
+                     "corfastq=s" => \$in_cor_file,
+                     "orgfastq=s" => \$in_org_file,
+                     "outfastq=s" => \$in_out_file,
+                   )
+       or $help) {
+      die $usage;
+   }
+
+   if (!defined($in_org_file)) {
+      die "\nERROR: An original fastq file name should be specified\n\n";
+   }
+   elsif (!(open FH_TEMP, "$in_org_file")) {
+      die "\nERROR: Cannot open $in_org_file\n\n";
+   }
+   close FH_TEMP;
+
+   if (!defined($in_cor_file)) {
+      die "\nERROR: An corrected fastq file name should be specified\n\n";
+   }
+   elsif (!(open FH_TEMP, "$in_cor_file")) {
+      die "\nERROR: Cannot open $in_cor_file\n\n";
+   }
+   close FH_TEMP;
+
+   if (!defined($in_out_file)) {
+      die "\nERROR: An output fastq file name should be specified\n\n";
+   }
+
+   print "     Parsing argumetns: done\n";
+}
+
+
+
+sub MergeFiles {
+   print "\nMerging files\n";
+
+   my $fh_cor;
+   my $fh_org;
+   my $fh_out;
+
+   # open files
+   open $fh_org, "$in_org_file"
+      or die "\nERROR: Cannot open $in_org_file\n\n";
+
+   open $fh_cor, "$in_cor_file"
+      or die "\nERROR: Cannot open $in_cor_file\n\n";
+
+   open $fh_out, ">$in_out_file"
+      or die "\nERROR: Cannot open $in_out_file\n\n";
+
+   my $line_cor;
+
+   # first lines
+   $line_cor = <$fh_cor>;
+
+   my $read_name_cor;
+   if ($line_cor =~ /^\@(\S+)/) {
+      $read_name_cor = $1;
+   }
+   else {
+      die "\nERROR $line_cor\n";
+   }
+
+   # process the org file
+   while (my $line_org = <$fh_org>) {
+      my $read_name_org;
+      if ($line_org =~ /^\@(\S+)/) {
+         $read_name_org = $1;
+      }
+      else {
+         die "\nERROR $line_org\n";
+      }
+
+      my $line_tmp;
+
+      # find the same read
+      if ($read_name_org eq $read_name_cor) {
+         print $fh_out $line_cor;
+         $line_cor = <$fh_cor>;
+         print $fh_out $line_cor;
+         $line_cor = <$fh_cor>;
+         print $fh_out $line_cor;
+         $line_cor = <$fh_cor>;
+         print $fh_out $line_cor;
+
+         # next read
+         $line_cor = <$fh_cor>;
+         if (defined($line_cor)) {
+            if ($line_cor =~ /^\@(\S+)/) {
+               $read_name_cor = $1;
+            }
+            else {
+               die "\nERROR $line_cor\n";
+            }
+         }
+         # ends of the corrected read file
+         else {
+            $read_name_cor = "";
+         }
+
+         $line_org = <$fh_org>;
+         $line_org = <$fh_org>;
+         $line_org = <$fh_org>;
+      }
+      # not find the same read
+      # write the org read
+      else {
+         print $fh_out $line_org;
+         $line_org = <$fh_org>;
+         print $fh_out $line_org;
+         $line_org = <$fh_org>;
+         print $fh_out $line_org;
+         $line_org = <$fh_org>;
+         print $fh_out $line_org;
+      }
+   }
+
+   # close files
+   close $fh_org;
+   close $fh_cor;
+   close $fh_out;
+
+   print "     Merging files: done\n";
+}

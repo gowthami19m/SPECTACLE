@@ -1,0 +1,17 @@
+#!/bin/bash
+
+export install_dir=${PWD}/install
+
+if [ -e install ]; then
+   rm -rf install
+fi
+mkdir install
+
+cd zlib-1.2.8
+
+./configure --prefix=${install_dir}
+
+make test
+make install
+
+cd ..

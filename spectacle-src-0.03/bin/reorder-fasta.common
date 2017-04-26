@@ -1,0 +1,195 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use File::Basename;
+use Getopt::Long;
+
+# use the library for version control
+my $directory;
+BEGIN {$directory = dirname $0;} 
+use lib "${directory}/../lib";
+
+if (!-e "${directory}/../lib/version.pm") {
+   die "\nERROR: ${directory}/../lib/version.pm does not exist\n\n";
+}
+use version;
+
+# turn on auto flush
+$| = 1;
+
+my $program_name       = basename $0;
+my $date               = $version::date;
+my $version            = $version::version;
+my $write_order_binary = "write-order-file.from-fastq.to-fasta.single.common";
+
+my $in_org_fastq;
+my $in_new_fasta;
+my $in_tmp_dir;
+
+my $out_order_file;
+my $out_fasta;
+
+my $help;
+
+my $header =
+"
+----------------------------------------------------------------------
+PROGRAM: $program_name
+CONTACT: Yun Heo (yunheo1\@illinois.edu)
+VERSION: $version
+DATE   : $date
+----------------------------------------------------------------------
+\n";
+
+my $usage =
+"USAGE: $program_name <ARGUMENTS>
+
+ARGUMENT          DESCRIPTION                      MANDATORY   DEFAULT
+----------------------------------------------------------------------
+-h                print help                       N
+-infasta  <file>  fasta file to be sorted          Y
+-orgfastq <file>  fastq file with a right order    Y
+-outfasta <file>  output fasta file                Y
+-tmp       <dir>  temporary directory for sorting  N
+----------------------------------------------------------------------
+\n";
+
+
+
+######################################################################
+# main code
+######################################################################
+
+&print_header;
+
+&parse_arguments;
+
+&write_order_file;
+
+&reorder_fasta_files;
+
+print "\n####################### SUCCESSFULLY COMPLETED #######################\n\n";
+
+######################################################################
+# end of main code
+######################################################################
+
+
+
+#---------------------------------------------------------------------
+# print_header
+#---------------------------------------------------------------------
+sub print_header {
+   print $header;
+}
+
+
+
+#---------------------------------------------------------------------
+# parse_arguments
+#---------------------------------------------------------------------
+sub parse_arguments {
+   my $base_name;
+
+   if (@ARGV == 0) {
+      die $usage;
+   }
+
+   print "Parsing arguments\n";
+
+   if (!GetOptions (
+                    "h"          => \$help,
+                    "orgfastq=s" => \$in_org_fastq,
+                    "infasta=s"  => \$in_new_fasta,
+                    "outfasta=s" => \$out_fasta,
+                    "tmp=s"      => \$in_tmp_dir,
+                   )
+       or $help) {
+      die $usage;
+   }
+
+   # original fastq
+   if (!defined($in_org_fastq)) {
+      die "\nERROR: A fastq file with a right order should be specified\n\n";
+   }
+   elsif (!-e "$in_org_fastq") {
+      die "\nERROR: Cannot open $in_org_fastq\n\n";
+   }
+
+   # fastq to be sorted
+   if (!defined($in_new_fasta)) {
+      die "\nERROR: A fasta file to be sorted should be specified\n\n";
+   }
+   elsif (!-e "$in_new_fasta") {
+      die "\nERROR: Cannot open $in_new_fasta\n\n";
+   }
+
+   # output fastq
+   if (!defined($out_fasta)) {
+      die "\nERROR: An output fasta file should be specified\n\n";
+   }
+
+   # tmp directory for sorting
+	if (defined($in_tmp_dir)) {
+      if (!-d $in_tmp_dir) {
+         die "\nERROR: $in_tmp_dir does not exist (or it is not a directory)\n\n";
+      }
+	}
+
+   # order file of $in_new_fasta
+   $out_order_file = $in_new_fasta . ".order";
+
+   print "     Parsing argumetns: done\n\n";
+}
+
+
+
+#---------------------------------------------------------------------
+# write_order_file
+#---------------------------------------------------------------------
+sub write_order_file {
+   print "Extracting the order of input reads\n";
+
+   if (!-e "${directory}/${write_order_binary}") {
+      die "\nERROR: ${directory}/${write_order_binary} does not exist\n\n";
+   }
+
+   my $log = system("${directory}/${write_order_binary} $in_org_fastq $in_new_fasta $out_order_file");
+   if ($log != 0) {
+      die "ERROR: ${write_order_binary} is not successfully finished\n\n";
+   }
+
+   if (!-e $out_order_file) {
+      die "\nERROR: $out_order_file is not generated\n\n";
+   }
+
+   print "     Extracting the order of input reads: done\n\n";
+}
+
+
+
+#---------------------------------------------------------------------
+# reorder_fasta_files
+#---------------------------------------------------------------------
+sub reorder_fasta_files {
+   print "Reordering output files\n";
+
+   my $cmd;
+
+   # set shell variables
+   $ENV{reorder_fastq_order}  = $out_order_file;
+
+   $ENV{reorder_fasta_input}  = $in_new_fasta;
+   $ENV{reorder_fasta_output} = $out_fasta;
+   if (defined($in_tmp_dir)) {
+      $ENV{reorder_fastq_tmp} = $in_tmp_dir;
+      $cmd = q{awk '{printf("%s%s", $0, (NR % 2 == 0) ? "\n" : "\v")}' $reorder_fasta_input | paste $reorder_fastq_order - | sort -T $reorder_fastq_tmp -k1 -n | cut -f 2- |  tr "\v" "\n" > $reorder_fasta_output};
+   }
+   else {
+      $cmd = q{awk '{printf("%s%s", $0, (NR % 2 == 0) ? "\n" : "\v")}' $reorder_fasta_input | paste $reorder_fastq_order - | sort -k1 -n | cut -f 2- |  tr "\v" "\n" > $reorder_fasta_output};
+   }
+   system($cmd);
+
+   print "     Reordering output files: done\n\n";
+}

@@ -1,0 +1,297 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use File::Basename;
+use Getopt::Long;
+
+# these modules should be installed
+eval {
+   use Bio::DB::Sam;
+};
+if ($@) {
+   die "\nERROR: Module Bio::DB::Sam is not installed\n\n";
+}
+
+# use the library for version control
+my $directory;
+BEGIN {$directory = dirname $0;} 
+use lib "${directory}/../lib";
+
+if (!-e "${directory}/../lib/version.pm") {
+   die "\nERROR: ${directory}/../lib/version.pm does not exist\n\n";
+}
+use version;
+
+# turn on auto flush
+$| = 1;
+
+my $program_name          = basename $0;
+my $date                  = $version::date;
+my $version               = $version::version;
+my $num_matched_bases     = 0;
+my $num_not_matched_bases = 0;
+my $num_inserted_bases    = 0;
+my $num_deleted_bases     = 0;
+my $num_total_bases_read  = 0;
+my $num_reads_in_bam      = 0;
+my $num_reads_in_read     = 0;
+my $num_exact_reads       = 0;
+
+my $in_bam_file;
+my $in_fasta_file;
+my $in_fastq_file;
+my $help;
+
+my $header =
+"
+----------------------------------------------------------------------
+PROGRAM: $program_name
+CONTACT: Yun Heo (yunheo1\@illinois.edu)
+VERSION: $version
+DATE   : $date
+----------------------------------------------------------------------
+\n";
+
+my $usage =
+"USAGE: $program_name <ARGUMENTS>
+
+ARGUMENT          DESCRIPTION                   MANDATORY      DEFAULT
+----------------------------------------------------------------------
+-h                print help                    N
+-bam    <file>    input bam file                Y
+-fasta  <file>    input fasta file              N
+-fastq  <file>    input fastq file              N
+----------------------------------------------------------------------
+\n";
+
+
+
+######################################################################
+# main code
+######################################################################
+
+&print_header;
+
+&parse_arguments;
+
+&parse_read_file;
+
+&calculate_similarity;
+
+print "\n####################### SUCCESSFULLY COMPLETED #######################\n\n";
+
+######################################################################
+# end of main code
+######################################################################
+
+
+
+#---------------------------------------------------------------------
+# print_header
+#---------------------------------------------------------------------
+sub print_header {
+   print $header;
+}
+
+
+
+#---------------------------------------------------------------------
+# parse_arguments
+#---------------------------------------------------------------------
+sub parse_arguments {
+   my $base_name;
+
+   if (@ARGV == 0) {
+      die $usage;
+   }
+
+   print "Parsing arguments\n";
+
+   if (!GetOptions (
+                    "h"        => \$help,
+                    "bam=s"    => \$in_bam_file,
+                    "fasta=s"  => \$in_fasta_file,
+                    "fastq=s"  => \$in_fastq_file,
+                   )
+       or $help) {
+      die $usage;
+   }
+
+   # bam file
+   if (!defined($in_bam_file)) {
+      die "\nERROR: The input bam file name should be specified\n\n";
+   }
+   elsif (!-e "$in_bam_file") {
+      die "\nERROR: Cannot open $in_bam_file\n\n";
+   }
+
+   # fasta file
+   if (!defined($in_fasta_file)) {
+      if (!defined($in_fastq_file)) {
+         die "\nERROR: Either -fasta or -fastq should be used\n\n";
+      }
+   }
+   elsif (!-e "$in_fasta_file") {
+      die "\nERROR: Cannot open $in_fasta_file\n\n";
+   }
+
+   # fastq file
+   if (!defined($in_fastq_file)) {
+      if (!defined($in_fasta_file)) {
+         die "\nERROR: Either -fasta or -fastq should be used\n\n";
+      }
+   }
+   elsif (!-e "$in_fastq_file") {
+      die "\nERROR: Cannot open $in_fastq_file\n\n";
+   }
+
+   print "     Parsing argumetns: done\n\n";
+}
+
+
+
+#---------------------------------------------------------------------
+# parse_read_file
+#---------------------------------------------------------------------
+sub parse_read_file {
+   my $fh_read;
+
+   if (defined($in_fasta_file)) {
+      open $fh_read, "$in_fasta_file"
+         or die "\nERROR: Cannot open $in_fasta_file\n\n";
+   }
+   else {
+      open $fh_read, "$in_fastq_file"
+         or die "\nERROR: Cannot open $in_fastq_file\n\n";
+   }
+
+   while (my $line = <$fh_read>) {
+      $line = <$fh_read>;
+
+      $num_total_bases_read += (length($line) - 1);
+
+      if (defined($in_fastq_file)) {
+         $line = <$fh_read>;
+         $line = <$fh_read>;
+      }
+
+      $num_reads_in_read++;
+   }
+
+   close $fh_read;
+}
+
+
+
+#---------------------------------------------------------------------
+# calculate_similarity
+#---------------------------------------------------------------------
+sub calculate_similarity {
+   print "Calculating percentage similarity\n";
+
+   my $fh_bam         = Bio::DB::Sam->new(-bam => $in_bam_file);
+   my $bam_iterator   = $fh_bam->features(-iterator => 1);
+   my $prev_pair_name = "";
+
+   my $align1;
+   my $align2;
+   my $tmp;
+   my $it_base;
+   my $base1;
+   my $base2;
+
+   while (my $each_alignment = $bam_iterator->next_seq) {
+      ($align1, $tmp, $align2) = $each_alignment->padded_alignment;
+
+      my $flag_mismatch = 0;
+
+      for ($it_base = 0; $it_base < length($align1); $it_base++) {
+         $base1 = substr($align1, $it_base, 1);
+         $base2 = substr($align2, $it_base, 1);
+
+         # ACGT in $base1
+         if ($base1 ne "-") {
+            if ($base2 ne "-") {
+               # A
+               # A
+               if ($base1 eq $base2) {
+                  $num_matched_bases++;
+               }
+               # A
+               # T
+               else {
+                  $num_not_matched_bases++;
+                  $flag_mismatch = 1;
+               }
+            }
+            # A
+            # -
+            else {
+               $num_deleted_bases++;
+               $flag_mismatch = 1;
+            }
+         }
+         # "-" in $base1
+         else {
+            # -
+            # A
+            if ($base2 ne "-") {
+               $num_inserted_bases++;
+            }
+            # -
+            # -
+            else {
+               die "\nERRROR: $align1 vs $align2\n\n";
+            }
+
+            $flag_mismatch = 1;
+         }
+      }
+
+      $num_reads_in_bam++;
+
+      # exactly matched read
+      if ($flag_mismatch == 0) {
+         $num_exact_reads++;
+      }
+   }
+
+   print "     Calculating percentage similarity: done\n";
+
+   # print the results
+   # it does not report the number of reads
+   # because a read can be split into smaller ones by an error correction tool
+   print "\n";
+   printf "Total number of bases in a read file (A)           : %12d\n", $num_total_bases_read;
+   printf "Total number of matched bases (B)                  : %12d\n", $num_matched_bases;
+   printf "Total number of not matched bases (C)              : %12d\n", $num_not_matched_bases;
+   printf "Total number of inserted bases (D)                 : %12d\n", $num_inserted_bases;
+   printf "Total number of deleted bases (E)                  : %12d\n", $num_deleted_bases;
+   printf "Total number of reads (F)                          : %12d\n", $num_reads_in_read;
+   printf "Total number of aligned reads (G)                  : %12d\n", $num_reads_in_bam;
+   printf "Total number of exactly aligned reads (H)          : %12d\n", $num_exact_reads;
+
+   if ($num_total_bases_read == 0) {
+      printf "Percentage of aligned bases (100 X (B + C + D) / A): %12s\n", "N/A (No base in the read file)";
+   }
+   else {
+      printf "Percentage of aligned bases (100 X (B + C + D) / A): %12.1f (%%)\n", 100.0 * $num_matched_bases / $num_total_bases_read;
+   }
+
+   if (($num_matched_bases + $num_not_matched_bases + $num_inserted_bases + $num_deleted_bases) == 0) {
+      printf "Percent similarity (100 X B / (B + C + D + E))     : %12s\n", "N/A (No aligned base)";
+   }
+   else {
+      printf "Percent similarity (100 X B / (B + C + D + E))     : %12.1f (%%)\n", 100.0 * $num_matched_bases / ($num_matched_bases + $num_not_matched_bases + $num_inserted_bases + $num_deleted_bases);
+   }
+
+   if ($num_reads_in_read == 0) {
+      printf "Percentage of aligned reads (100 X G / F)          : %12s\n", "N/A (No aligned base)";
+      printf "Percentage of exactly aligned reads (100 X H / F)  : %12s\n", "N/A (No aligned base)";
+   }
+   else {
+      printf "Percentage of aligned reads (100 X G / F)          : %12.1f (%%)\n", 100.0 * $num_reads_in_bam / $num_reads_in_read;
+      printf "Percentage of exactly aligned reads (100 X H / F)  : %12.1f (%%)\n", 100.0 * $num_exact_reads / $num_reads_in_read;
+   }
+}

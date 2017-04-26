@@ -1,0 +1,460 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use File::Basename;
+use Getopt::Long;
+
+# use the library for version control
+my $directory;
+BEGIN {$directory = dirname $0;} 
+use lib "${directory}/../lib";
+
+if (!-e "${directory}/../lib/version.pm") {
+   die "\nERROR: ${directory}/../lib/version.pm does not exist\n\n";
+}
+use version;
+
+$| = 1;
+
+my $program_name = basename $0;
+
+my $date    = $version::date;
+my $version = $version::version;
+my $help;
+
+my $forward_file;
+my $reverse_file;
+my $location_file;
+my $input_format;
+my $prefix;
+
+my $out_genome_a_1;
+my $out_genome_a_2;
+my $out_genome_b_1;
+my $out_genome_b_2;
+
+my $header =
+"
+----------------------------------------------------------------------
+PROGRAM: $program_name
+AUTHOR : Yun Heo
+VERSION: $version
+DATE   : $date
+----------------------------------------------------------------------
+\n";
+
+my $usage =
+"USAGE: $program_name <ARGUMENTS>
+
+ARGUMENT                 DESCRIPTION             MANDATORY     DEFAULT
+----------------------------------------------------------------------
+-1 <file>                forward read file       Y
+-2 <file>                reverse read file       Y
+-format <fasta | fastq>  input format
+-h                       print help              N
+-location <file>         error location file     Y
+-prefix <string>         output prefix           Y
+----------------------------------------------------------------------
+\n";
+
+
+
+######################################################################
+# main code
+######################################################################
+
+&print_header;
+
+&parse_arguments;
+
+&split_file;
+
+print "\n####################### SUCCESSFULLY COMPLETED #######################\n\n";
+
+######################################################################
+# end of main code
+######################################################################
+
+
+
+sub print_header {
+	print $header;
+}
+
+
+
+sub parse_arguments {
+	my $base_name;
+
+	if (@ARGV == 0) {
+		die $usage;
+	}
+
+	print "Parsing arguments\n";
+
+	if (!GetOptions (
+						 	"h"          => \$help,
+							"1=s"        => \$forward_file,
+							"2=s"        => \$reverse_file,
+							"format=s"   => \$input_format,
+							"location=s" => \$location_file,
+							"prefix=s"   => \$prefix,
+	                )
+       or $help) {
+		die $usage;
+	}
+
+   # forward read
+	if (!defined($forward_file)) {
+		die "\nERROR: Forward read file name should be specified\n\n";
+	}
+	elsif (!-e $forward_file) {
+		die "\nERROR: Cannot open $forward_file\n\n";
+	}
+
+   # reverse read
+	if (!defined($reverse_file)) {
+		die "\nERROR: Forward read file name should be specified\n\n";
+	}
+	elsif (!-e $reverse_file) {
+		die "\nERROR: Cannot open $reverse_file\n\n";
+	}
+
+   # location file
+	if (!defined($location_file)) {
+		die "\nERROR: Info file name should be specified\n\n";
+	}
+	elsif (!-e $location_file) {
+		die "\nERROR: Cannot open $location_file\n\n";
+	}
+
+   # input read format
+	if (!defined($input_format)) {
+		die "\nERROR: The input file format should be specified\n\n";
+	}
+	else {
+      $input_format = lc $input_format;
+
+      if (($input_format ne "fasta") && ($input_format ne "fastq")) {
+		   die "\nERROR: The input file format should be fastq or fasta $input_format\n\n";
+      }
+	}
+
+   # prefix
+	if (!defined($prefix)) {
+		die "\nERROR: Output prefix should be specified\n\n";
+	}
+   else {
+      if ($input_format eq "fasta") {
+         $out_genome_a_1 = $prefix . ".genome-a.1.fasta";
+         $out_genome_a_2 = $prefix . ".genome-a.2.fasta";
+         $out_genome_b_1 = $prefix . ".genome-b.1.fasta";
+         $out_genome_b_2 = $prefix . ".genome-b.2.fasta";
+      }
+      elsif ($input_format eq "fastq") {
+         $out_genome_a_1 = $prefix . ".genome-a.1.fastq";
+         $out_genome_a_2 = $prefix . ".genome-a.2.fastq";
+         $out_genome_b_1 = $prefix . ".genome-b.1.fastq";
+         $out_genome_b_2 = $prefix . ".genome-b.2.fastq";
+      }
+      else {
+         die "\nERROR: Illegal file format $input_format\n\n";
+      }
+   }
+
+	print "     Parsing argumetns: done\n";
+}
+
+
+
+#----------------------------------------------------------------------
+# split_file
+#----------------------------------------------------------------------
+sub split_file {
+   open FH_LOCATION, "$location_file"
+      or die "\nERROR: Cannot open $location_file\n\n";
+   open FH_1, "$forward_file"
+      or die "\nERROR: Cannot open $forward_file\n\n";
+   open FH_2, "$reverse_file"
+      or die "\nERROR: Cannot open $reverse_file\n\n";
+
+   open FH_OUT_A_1, ">$out_genome_a_1"
+      or die "\nERROR: Cannot open $out_genome_a_1\n\n";
+   open FH_OUT_A_2, ">$out_genome_a_2"
+      or die "\nERROR: Cannot open $out_genome_a_2\n\n";
+   open FH_OUT_B_1, ">$out_genome_b_1"
+      or die "\nERROR: Cannot open $out_genome_b_1\n\n";
+   open FH_OUT_B_2, ">$out_genome_b_2"
+      or die "\nERROR: Cannot open $out_genome_b_2\n\n";
+
+   #my $name_not_matched = 0;
+   my $num_lines        = 0;
+
+   # each info file line
+   while (my $line_location = <FH_LOCATION>) {
+      # <read name> <ref 1 or 2> <ref name> <strand> <start index> <read length> <substitutions> <insertions> <deletions>
+      if ($line_location =~ /^(\S+)\s+([12])\s+\S+\s+[\+\-]\s+[\d\-]+\s+\d+\s+\S+\s+\S+\s+\S+/) {
+         my $read_name1;
+         my $read_name2;
+         my $genome1;
+         my $genome2;
+
+         $read_name1 = $1;
+         $genome1    = $2;
+
+         # take the next info line
+         $line_location = <FH_LOCATION>;
+
+         if (defined($line_location) == 0) {
+            die "\nERROR: The number of reads in $location_file is not even\n\n";
+         }
+         elsif ($line_location =~ /^(\S+)\s+([12])\s+\S+\s+[\+\-]\s+[\d\-]+\s+\d+\s+\S+\s+\S+\s+\S+/) {
+            $read_name2 = $1;
+            $genome2    = $2;
+
+            my $read_name1_tmp = $read_name1;
+            my $read_name2_tmp = $read_name2;
+
+            $read_name1_tmp =~ s/\/1$//;
+            $read_name2_tmp =~ s/\/2$//;
+
+            # compare two read names
+            if ($read_name1_tmp ne $read_name2_tmp) {
+               die "\nERROR: Read names are not matched $read_name1 vs $read_name2\n\n";
+            }
+
+            # compare genomes
+            if ($genome1 ne $genome2) {
+               die "\nERROR: Genomes are not matched $genome1 vs $genome2\n\n";
+            }
+         }
+         else {
+            die "\nERROR: Wrong line $line_location\n";
+         }
+
+         # take read lines
+         my $line_read;
+         my $line_read_tmp;
+
+         # forward
+         $line_read = <FH_1>;
+
+         if (defined($line_read) == 0) {
+            die "\nERROR: The number of reads in $location_file is not matched with that in $forward_file\n\n";
+         }
+         else {
+            if ($input_format eq "fasta") {
+               if ($line_read !~ /^>/) {
+                die "\nERROR: Wrong header $line_read\n";
+               }
+            }
+            elsif ($input_format eq "fastq") {
+               if ($line_read !~ /^@/) {
+                die "\nERROR: Wrong header $line_read\n";
+               }
+            }
+            else {
+               die "\nERROR: Illegal file format $input_format\n\n";
+            }
+         }
+
+         #if ($name_not_matched == 0) {
+         #   $line_read_tmp = $line_read;
+         #   chomp $line_read_tmp;
+         #   $line_read_tmp =~ s/^@//;
+
+         #   if ($line_read_tmp ne $read_name1) {
+         #      print "     WARNING: Read name mismatch $read_name1 vs $line_read_tmp (this message is printed only once)\n";
+         #      $name_not_matched = 1;
+         #   }
+         #}
+
+         if ($genome1 eq "1") {
+            # write the original name
+            # header
+            if ($input_format eq "fasta") {
+               print FH_OUT_A_1 ">${read_name1}\n";
+            }
+            elsif ($input_format eq "fastq") {
+               print FH_OUT_A_1 "\@${read_name1}\n";
+            }
+            else {
+               die "\nERROR: Illegal file format $input_format\n\n";
+            }
+
+            # sequence
+            $line_read = <FH_1>;
+            print FH_OUT_A_1 $line_read;
+
+            # quality score
+            if ($input_format eq "fastq") {
+               $line_read = <FH_1>;
+               print FH_OUT_A_1 $line_read;
+
+               $line_read = <FH_1>;
+               print FH_OUT_A_1 $line_read;
+            }
+         }
+         elsif ($genome1 eq "2") {
+            # write the original name
+            # header
+            if ($input_format eq "fasta") {
+               print FH_OUT_B_1 ">${read_name1}\n";
+            }
+            elsif ($input_format eq "fastq") {
+               print FH_OUT_B_1 "\@${read_name1}\n";
+            }
+            else {
+               die "\nERROR: Illegal file format $input_format\n\n";
+            }
+
+            # sequence
+            $line_read = <FH_1>;
+            print FH_OUT_B_1 $line_read;
+
+            # quality score
+            if ($input_format eq "fastq") {
+               $line_read = <FH_1>;
+               print FH_OUT_B_1 $line_read;
+
+               $line_read = <FH_1>;
+               print FH_OUT_B_1 $line_read;
+            }
+         }
+         else {
+            die "\nERROR: Wrong genome name $genome1\n\n";
+         }
+
+         # reverse
+         $line_read = <FH_2>;
+
+         if (defined($line_read) == 0) {
+            die "\nERROR: The number of reads in $location_file is not matched with that in $reverse_file\n\n";
+         }
+         else {
+            if ($input_format eq "fasta") {
+               if ($line_read !~ /^>/) {
+                die "\nERROR: Wrong header $line_read\n";
+               }
+            }
+            elsif ($input_format eq "fastq") {
+               if ($line_read !~ /^@/) {
+                die "\nERROR: Wrong header $line_read\n";
+               }
+            }
+            else {
+               die "\nERROR: Illegal file format $input_format\n\n";
+            }
+         }
+
+         if ($genome1 eq "1") {
+            # write the original name
+            # header
+            if ($input_format eq "fasta") {
+               print FH_OUT_A_2 ">${read_name2}\n";
+            }
+            elsif ($input_format eq "fastq") {
+               print FH_OUT_A_2 "\@${read_name2}\n";
+            }
+            else {
+               die "\nERROR: Illegal file format $input_format\n\n";
+            }
+
+            # sequence
+            $line_read = <FH_2>;
+            print FH_OUT_A_2 $line_read;
+
+            # quality score
+            if ($input_format eq "fastq") {
+               $line_read = <FH_2>;
+               print FH_OUT_A_2 $line_read;
+
+               $line_read = <FH_2>;
+               print FH_OUT_A_2 $line_read;
+            }
+         }
+         elsif ($genome1 eq "2") {
+            # write the original name
+            # header
+            if ($input_format eq "fasta") {
+               print FH_OUT_B_2 ">${read_name2}\n";
+            }
+            elsif ($input_format eq "fastq") {
+               print FH_OUT_B_2 "\@${read_name2}\n";
+            }
+            else {
+               die "\nERROR: Illegal file format $input_format\n\n";
+            }
+
+            # sequence
+            $line_read = <FH_2>;
+            print FH_OUT_B_2 $line_read;
+
+            # quality score
+            if ($input_format eq "fastq") {
+               $line_read = <FH_2>;
+               print FH_OUT_B_2 $line_read;
+
+               $line_read = <FH_2>;
+               print FH_OUT_B_2 $line_read;
+            }
+         }
+         else {
+            die "\nERROR: Wrong genome name $genome2\n\n";
+         }
+
+         $num_lines++;
+         if ($num_lines % 100000 == 0) {
+            printf "     %12d lines processed\n", $num_lines;
+         }
+      }
+      elsif ($line_location =~ /^(\S+)\s+N\/A/) {
+         # take the next info line
+         $line_location = <FH_LOCATION>;
+
+         my $line_read;
+
+         if ($line_location =~ /^(\S+)\s+N\/A/) {
+            $line_read = <FH_1>;
+            $line_read = <FH_1>;
+
+            if ($input_format eq "fastq" ) {
+               $line_read = <FH_1>;
+               $line_read = <FH_1>;
+
+               $line_read = <FH_2>;
+               $line_read = <FH_2>;
+            }
+         }
+         else {
+            die "\nERROR: Wrong location line $line_location\n";
+         }
+      }
+      else {
+         die "\nERROR: Wrong location line $line_location\n";
+      }
+   }
+
+   # check if remaining lines exist in read files
+   my $line_check;
+
+   $line_check = <FH_1>;
+   if (defined($line_check)) {
+      die "\nERROR: The number of lines in $location_file is not matched with that in $forward_file\n\n";
+   }
+
+   $line_check = <FH_2>;
+   if (defined($line_check)) {
+      die "\nERROR: The number of lines in $location_file is not matched with that in $reverse_file\n\n";
+   }
+
+   close FH_LOCATION;
+   close FH_1;
+   close FH_2;
+
+   close FH_OUT_A_1;
+   close FH_OUT_A_2;
+   close FH_OUT_B_1;
+   close FH_OUT_B_2;
+}

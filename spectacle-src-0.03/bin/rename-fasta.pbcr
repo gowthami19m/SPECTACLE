@@ -1,0 +1,204 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use File::Basename;
+use Getopt::Long;
+
+# use the library for version control
+my $directory;
+BEGIN {$directory = dirname $0;} 
+use lib "${directory}/../lib";
+
+if (!-e "${directory}/../lib/version.pm") {
+   die "\nERROR: ${directory}/../lib/version.pm does not exist\n\n";
+}
+use version;
+
+# turn on auto flush
+$| = 1;
+
+my $full_name    = $0; 
+my $program_name = basename $0; 
+my $date         = $version::date;
+my $version      = $version::version;
+
+my $in_map_file;
+my $in_fasta_file;
+my $in_location_file;
+
+my $out_fasta_file;
+
+my $help;
+
+# find original read names using new read names
+# key  : new read name
+# value: original read name
+my %hash_read_name;
+
+# number of new reads that are mapped to a specific original read name
+# key  : original read name
+# value: number of occurrences in the new read file
+my %hash_read_occurrence;
+
+my $header =
+"
+----------------------------------------------------------------------
+AUTHOR : Yun Heo
+VERSION: $version
+DATE   : $date
+----------------------------------------------------------------------
+\n";
+
+my $usage =
+"USAGE: $program_name <ARGUMENTS>
+
+ARGUMENT       DESCRIPTION                   MANDATORY         DEFAULT
+----------------------------------------------------------------------
+-h             print help                    N
+-f <file>      input fasta file              Y
+-l <file>      errors location file          Y
+-m <file>      input pbcr log file           Y
+-o <file>      output fasta file             Y
+----------------------------------------------------------------------
+\n";
+
+
+
+######################################################################
+# main code
+######################################################################
+
+&print_header;
+
+&parse_arguments;
+
+&rename_pbcr_fasta;
+
+print "\n####################### SUCCESSFULLY COMPLETED #######################\n\n";
+
+######################################################################
+# end of main code
+######################################################################
+
+
+
+#---------------------------------------------------------------------
+# print_header
+#---------------------------------------------------------------------
+sub print_header {
+   print $header;
+}
+
+
+
+#---------------------------------------------------------------------
+# parse_arguments
+#---------------------------------------------------------------------
+sub parse_arguments {
+   my $base_name;
+
+   if (@ARGV == 0) {
+      die $usage;
+   }
+
+   print "Parsing arguments\n";
+
+   if (!GetOptions (
+                    "h"   => \$help,
+                    "f=s" => \$in_fasta_file,
+                    "l=s" => \$in_location_file,
+                    "m=s" => \$in_map_file,
+                    "o=s" => \$out_fasta_file,
+                   )
+       or $help) {
+      die $usage;
+   }
+
+   if (!defined($in_fasta_file)) {
+      die "\nERROR: Input fasta file name should be specified\n\n";
+   }
+   elsif (!-e "$in_fasta_file") {
+      die "\nERROR: Cannot open $in_fasta_file\n\n";
+   }
+
+   if (!defined($in_location_file)) {
+      die "\nERROR: Input locaion file name should be specified\n\n";
+   }
+   elsif (!-e "$in_location_file") {
+      die "\nERROR: Cannot open $in_location_file\n\n";
+   }
+
+   if (!defined($out_fasta_file)) {
+      die "\nERROR: An output fasta file name should be specified\n\n";
+   }
+
+   print "     Parsing argumetns: done\n\n";
+}
+
+
+
+#---------------------------------------------------------------------
+# rename_pbcr_fasta
+#---------------------------------------------------------------------
+sub rename_pbcr_fasta {
+   print "Rename read names\n";
+
+   # construct hash tables
+   open FH_MAP, "$in_map_file"
+      or die "\nERROR: Cannot open $in_map_file\n\n";
+
+   my $org_name;
+   my $new_name;
+
+   while (my $line = <FH_MAP>) {
+      if ($line =~ /^(\S+)\s+(\S+)\s+\d+\s+\d+\s+\d+\s+\d+/) {
+         $org_name = $1;
+         $new_name = $2;
+
+         # <original read name> = $hash_read_name{<new read name>}
+         $hash_read_name{$new_name} = $org_name;
+      }
+   }
+
+   close FH_MAP;
+
+   # rename the fasta file
+   open FH_IN_FASTA, "$in_fasta_file"
+      or die "\nERROR: Cannot open $in_fasta_file\n\n";
+   open FH_OUT_FASTA, ">$out_fasta_file"
+      or die "\nERROR: Cannot open $out_fasta_file\n\n";
+
+   my $line_name;
+   my $line_sequence;
+
+   while ($line_name = <FH_IN_FASTA>) {
+      $line_sequence = <FH_IN_FASTA>;
+
+      if ($line_name =~ /^>(\S+)/) {
+         my $new_name = $1;
+         $new_name =~ s/\/[\d_]+$//;
+
+         if (defined($hash_read_name{$new_name})) {
+            print FH_OUT_FASTA ">$hash_read_name{$new_name}\n";
+            print FH_OUT_FASTA $line_sequence;
+
+            if (defined($hash_read_occurrence{$hash_read_name{$new_name}})) {
+               $hash_read_occurrence{$hash_read_name{$new_name}}++;
+            }
+            else {
+               $hash_read_occurrence{$hash_read_name{$new_name}} = 1;
+            }
+         }
+         # cannot find the mapping information for this name
+         else {
+            die "\nERROR: Cannot find the mapping information of $new_name\n\n";
+         }
+      }
+   }
+
+   close FH_IN_FASTA;
+   close FH_OUT_FASTA;
+
+   print "     Rename read names: done\n\n";
+}

@@ -1,0 +1,358 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use File::Basename;
+use Getopt::Long;
+
+# these modules should be installed
+eval {
+   use Bio::DB::Sam;
+};
+if ($@) {
+   die "\nERROR: Module Bio::DB::Sam is not installed\n\n";
+}
+
+# use the library for version control
+my $directory;
+BEGIN {$directory = dirname $0;}
+use lib "${directory}/../lib";
+
+if (!-e "${directory}/../lib/version.pm") {
+   die "\nERROR: ${directory}/../lib/version.pm does not exist\n\n";
+}
+use version;
+
+# turn on auto flush
+$| = 1;
+
+my $program_name = basename $0;
+my $date         = $version::date;
+my $version      = $version::version;
+
+# input arguments
+my $in_chromosome;
+my $in_location_file;
+my $in_vcf_file;
+my $in_prefix;
+my $out_location_file;
+
+my $total_substitutions         = 0;
+my $total_substitutions_removed = 0;
+
+my $out_remove_list_file;
+my $help;
+
+my %hash_heterozygosity;
+
+my $header =
+"
+----------------------------------------------------------------------
+PROGRAM: $program_name
+CONTACT: Yun Heo (yunheo1\@illinois.edu)
+VERSION: $version
+DATE   : $date
+----------------------------------------------------------------------
+\n";
+
+my $usage =
+"USAGE: $program_name <ARGUMENTS>
+
+ARGUMENT          DESCRIPTION                   MANDATORY      DEFAULT
+----------------------------------------------------------------------
+-chr      <str>   chromosome name               Y
+-h                print help                    N
+-location <file>  error location file           Y
+-prefix <prefix>  output prefix                 Y
+-out      <file>  output location file          Y
+-vcf      <file>  input vcf file                Y
+----------------------------------------------------------------------
+\n";
+
+
+
+######################################################################
+# main code
+######################################################################
+
+&print_header;
+
+&parse_arguments;
+
+&read_heterozygosities;
+
+&remove_heterozygosities;
+
+print "\n####################### SUCCESSFULLY COMPLETED #######################\n\n";
+
+######################################################################
+# end of main code
+######################################################################
+
+
+
+#---------------------------------------------------------------------
+# print_header
+#---------------------------------------------------------------------
+sub print_header {
+   print $header;
+}
+
+
+
+#---------------------------------------------------------------------
+# parse_arguments
+#---------------------------------------------------------------------
+sub parse_arguments {
+   my $base_name;
+
+   if (@ARGV == 0) {
+      die $usage;
+   }
+
+   print "Parsing arguments\n";
+
+   if (!GetOptions (
+                    "h"          => \$help,
+                    "chr=s"      => \$in_chromosome,
+                    "location=s" => \$in_location_file,
+                    "out=s"      => \$out_location_file,
+                    "prefix=s"      => \$in_prefix,
+                    "vcf=s"      => \$in_vcf_file,
+                   )
+       or $help) {
+      die $usage;
+   }
+
+   # chromosome
+   if (!defined($in_chromosome)) {
+      die "\nERROR: A chromosome name should be specified\n\n";
+   }
+
+   # location file
+   if (!defined($in_location_file)) {
+      die "\nERROR: A location file name should be specified\n\n";
+   }
+   elsif (!-e $in_location_file) {
+      die "\nERROR: Cannot open $in_location_file\n\n";
+   }
+
+   # output prefix
+   if (!defined($in_prefix)) {
+      die "\nERROR: A output prefix should be specified\n\n";
+   }
+
+   $out_remove_list_file = $in_prefix . ".removed";
+
+   # vcf file
+   if (!defined($in_vcf_file)) {
+      die "\nERROR: A VCF file name should be specified\n\n";
+   }
+   elsif (!-e $in_vcf_file) {
+      die "\nERROR: Cannot open $in_vcf_file\n\n";
+   }
+
+   # output location file
+   if (!defined($out_location_file)) {
+      die "\nERROR: An output location file name should be specified\n\n";
+   }
+
+   print "     Parsing argumetns: done\n\n";
+}
+
+
+
+#---------------------------------------------------------------------
+# read_heterozygosities
+#---------------------------------------------------------------------
+sub read_heterozygosities {
+   print "Reading heterozygosities\n";
+
+   open FH_VCF, "$in_vcf_file"
+      or die "\nERROR: Cannot open $in_vcf_file\n\n";
+
+   while (my $line_location = <FH_VCF>) {
+      # <chrom> <pos> <id> <ref> <alt> <qual> <filter> ...
+      if ($line_location !~ /^#/) {
+         if ($line_location =~ /^(\S+)\s+(\S+)\s+\S+\s+([ACGT])\s+(\S+)\s+\S+\s+(\S+)/) {
+            my $chromosome   = $1;
+            my $position     = $2;
+            my $ref_base     = $3;
+            my $alternatives = $4;
+            my $filter       = $5;
+
+            if ($chromosome eq $in_chromosome) {
+               if ($alternatives !~ /[ACGT][ACGT]/) {
+                  if (($filter eq ".") || ($filter eq "PASS")) {
+                     $alternatives =~ s/,//g;
+
+                     # position: 1-based
+                     # alternatives: positive-strand-based
+                     $hash_heterozygosity{$position} = $alternatives;
+                  }
+               }
+            }
+         }
+      }
+   }
+
+   close FH_VCF;
+
+   print "     Reading heterozygosities: done\n\n";
+}
+
+
+
+#---------------------------------------------------------------------
+# remove_heterozygosities
+#---------------------------------------------------------------------
+sub remove_heterozygosities {
+   print "Removing heterozygosities\n";
+
+   open FH_LOCATION, "$in_location_file"
+      or die "\nERROR: Cannot open $in_location_file\n\n";
+   open FH_OUT, ">$out_location_file"
+      or die "\nERROR: Cannot open $out_location_file\n\n";
+   open FH_REMOVE, ">$out_remove_list_file"
+      or die "\nERROR: Cannot open $out_remove_list_file\n\n";
+
+   my $position;
+   my $position_converted;
+   my $ref_base;
+   my $err_base;
+   my $err_base_pos_strand;
+   my $read_name;
+   my $ref_number;
+   my $chromosome;
+   my $strand;
+   my $start;
+   my $read_length;
+   my $substitution;
+   my $remaining;
+   my $substitution_new;
+   my $flag_written;
+
+   while (my $line_location = <FH_LOCATION>) {
+      # <read name> <ref 1 or 2> <ref name> <strand> <start index> <read length> <substitutions> <insertions> <deletions>
+      if ($line_location =~ /^(\S+)\s+([12])\s+(\S+)\s+([\+\-])\s+([\d\-]+)\s+(\d+)\s+(\S+)\s+(\S+\s+\S+)/) {
+         $read_name    = $1;
+         $ref_number   = $2;
+         $chromosome   = $3;
+         $strand       = $4;
+         $start        = $5;
+         $read_length  = $6;
+         $substitution = $7;
+         $remaining    = $8;
+
+         if ($ref_number == 2) {
+            die "\nERROR: Simulated reads should not be used\n\n";
+         }
+
+         # chromosome not matched
+         if ($chromosome eq $in_chromosome) {
+            # no substitution error
+            if ($substitution eq "-") {
+               print FH_OUT $line_location;
+            }
+            else {
+               $substitution_new = "";
+               $flag_written     = 0;
+
+               # iterate substitution errors
+               while ($substitution =~ /(\d+):([ACGT])\->([ACGT]);/g) {
+                  $position = $1;
+                  $ref_base = $2;
+                  $err_base = $3;
+
+                  if ($strand eq "+") {
+                     $position_converted  = $start + $position - 1;
+                     $err_base_pos_strand = $err_base;
+                  }
+                  else {
+                     $position_converted = $start + $read_length - $position;
+
+                     # always positive strand
+                     $err_base_pos_strand = &reverse_complement($err_base);
+                  }
+
+                  # this position exists in the heterozygosity hash
+                  if (defined($hash_heterozygosity{$position_converted})) {
+                     # this bases exists in the hash
+                     if ($hash_heterozygosity{$position_converted} =~ /$err_base_pos_strand/) {
+                        if ($flag_written == 0) {
+                           print FH_REMOVE "$read_name ";
+                           $flag_written = 1;
+                        }
+
+                        print FH_REMOVE "$position:$ref_base->$err_base;";
+
+                        $total_substitutions_removed++;
+                     }
+                     else {
+                        $substitution_new = $substitution_new . "${position}:${ref_base}\->${err_base};";
+                     }
+                  }
+                  else {
+                     $substitution_new = $substitution_new . "${position}:${ref_base}\->${err_base};";
+                  }
+
+                  $total_substitutions++;
+               }
+
+               if ($flag_written == 1) {
+                  print FH_REMOVE "\n";
+               }
+
+               # all the substitutions are removed
+               if ($substitution_new eq "") {
+                  $substitution_new = "-";
+               }
+
+               print FH_OUT "$read_name $ref_number $chromosome $strand $start $read_length $substitution_new $remaining\n";
+            }
+         }
+         else {
+            print FH_OUT $line_location;
+         }
+      }
+      # N/A line
+      elsif ($line_location =~ /^(\S+)\s+N\/A$/) {
+         print FH_OUT $line_location;
+      }
+      else {
+         die "\nERROR: $line_location\n";
+      }
+   }
+
+   close FH_LOCATION;
+   close FH_OUT;
+   close FH_REMOVE;
+
+   printf "     Total number of substitutions in the target chromosome: %12d\n", $total_substitutions;
+   printf "     Total number of removed substitutions                 : %12d\n", $total_substitutions_removed;
+
+   print  "     Removing heterozygosities: done\n";
+}
+
+
+
+#---------------------------------------------------------------------
+# reverse_complement
+#---------------------------------------------------------------------
+sub reverse_complement {
+   if ($_[0] eq "A") {
+      return "T";
+   }
+   elsif ($_[0] eq "C") {
+      return "G";
+   }
+   elsif ($_[0] eq "G") {
+      return "C";
+   }
+   elsif ($_[0] eq "T") {
+      return "A";
+   }
+   else {
+      die "\nERROR: Illegal character $_[0]\n\n";
+   }
+}
