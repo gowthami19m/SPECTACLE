@@ -17,6 +17,7 @@ How to install
 You can download the latest release of SPECTACLE here.
 
 $ cd spectacle-src-X.XX
+
 $ make
 
 ---------------
